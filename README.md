@@ -48,3 +48,17 @@ The configuration deliberately separates the public DoH listener from the DNS he
 ## License
 
 See [`LICENSE`](LICENSE).
+
+# ⚡ Bandwidth Hero Server
+
+A lightweight image optimization proxy designed to slash bandwidth usage and accelerate web browsing.
+
+Bandwidth Hero Server fetches remote images, compresses them on the fly, and delivers optimized versions to the client. This significantly reduces data consumption while improving page load performance.
+
+🖥️ **Live Demo:** [Bandwidth Hero](https://bhserv.netlify.app/).
+
+## Supporting the Project
+
+If you find this project useful, donations are appreciated:
+- **Bitcoin**: `1HntwKxyqGCfnSGvGLMUTRAqLnTvLarAQP`
+
