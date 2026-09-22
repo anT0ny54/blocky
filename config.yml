@@ -41,6 +41,12 @@ rateLimit:
   ipv4Prefix: 32
   ipv6Prefix: 64
 
-# Query logging is intentionally disabled.
 log:
   level: info
+
+# Query logging is intentionally disabled: the "queryLog" section is
+# omitted entirely (no type/target configured), so Blocky never persists
+# per-query logs. This is a separate concern from the "log" level above,
+# which only controls general application log verbosity.
+queryLog:
+  type: none
