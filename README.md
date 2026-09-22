@@ -29,6 +29,7 @@ The following public DoH endpoints were listed with this project. Availability, 
 | `https://dns-pi.vercel.app/api/doh/dns-query` | Public DoH endpoint |
 | `https://dnssix.netlify.app/api/doh/dns-query` | Public DoH endpoint |
 | `https://dns-93aca.containers.snapdeploy.app/dns-query` | SnapDeploy-hosted endpoint; may sleep when idle |
+| `https://doh-93aca.containers.snapdeploy.app/dns-query` | SnapDeploy-hosted endpoint; may sleep when idle |
 
 For the filtering backend used by this repository, the configured HaGeZi resolvers are:
 
