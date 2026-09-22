@@ -276,7 +276,8 @@ func (t *sourceTable) shard(key string) *stateShard {
 }
 
 func (t *sourceTable) getOrCreate(key string, now time.Time, rate, burst float64) *clientState {
-	s := t.shard(key)
+	shardIdx := t.sourceHash(key) % uint64(t.shardCount)
+	s := &t.shards[shardIdx]
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if st := s.clients[key]; st != nil {
@@ -284,7 +285,7 @@ func (t *sourceTable) getOrCreate(key string, now time.Time, rate, burst float64
 		return st
 	}
 
-	if len(s.clients) >= t.shardLimit[t.sourceHash(key)%uint64(t.shardCount)] {
+	if len(s.clients) >= t.shardLimit[shardIdx] {
 		var victimKey string
 		var victim *clientState
 		for k, candidate := range s.clients {
@@ -335,13 +336,68 @@ func (t *sourceTable) allow(key string, now time.Time, rate, burst float64) bool
 	return true
 }
 
+// admitOrAllow performs the getOrCreate + token-bucket check under a single
+// shard lock, instead of two separate locked calls. This halves the mutex
+// acquisitions on the connectionless UDP path, where both steps run for
+// every inbound packet.
+func (t *sourceTable) admitOrAllow(key string, now time.Time, rate, burst float64) bool {
+	shardIdx := t.sourceHash(key) % uint64(t.shardCount)
+	s := &t.shards[shardIdx]
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	st := s.clients[key]
+	if st == nil {
+		if len(s.clients) >= t.shardLimit[shardIdx] {
+			var victimKey string
+			var victim *clientState
+			for k, candidate := range s.clients {
+				if candidate.conns != 0 {
+					continue
+				}
+				if now.Sub(candidate.lastSeen) >= t.stateIdle {
+					victimKey = k
+					victim = candidate
+					break
+				}
+				if victim == nil || candidate.lastSeen.Before(victim.lastSeen) {
+					victimKey = k
+					victim = candidate
+				}
+			}
+			if victim == nil || victim.conns != 0 {
+				return false
+			}
+			delete(s.clients, victimKey)
+		}
+		st = &clientState{tokens: burst, last: now, lastSeen: now}
+		s.clients[key] = st
+	}
+
+	elapsed := now.Sub(st.last).Seconds()
+	if elapsed > 0 {
+		st.tokens += elapsed * rate
+		if st.tokens > burst {
+			st.tokens = burst
+		}
+		st.last = now
+	}
+	st.lastSeen = now
+	if st.tokens < 1 {
+		return false
+	}
+	st.tokens--
+	return true
+}
+
 func (t *sourceTable) admitConn(key string, max int32, now time.Time, rate, burst float64) (*clientState, bool) {
-	s := t.shard(key)
+	shardIdx := t.sourceHash(key) % uint64(t.shardCount)
+	s := &t.shards[shardIdx]
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	st := s.clients[key]
 	if st == nil {
-		if len(s.clients) >= t.shardLimit[t.sourceHash(key)%uint64(t.shardCount)] {
+		if len(s.clients) >= t.shardLimit[shardIdx] {
 			var victimKey string
 			var victim *clientState
 			for k, candidate := range s.clients {
@@ -525,7 +581,6 @@ func (l *guardedListener) Accept() (net.Conn, error) {
 		if !ok {
 			_ = conn.Close()
 			l.guard.releaseGlobal()
-			_ = state
 			continue
 		}
 		if tcp, ok := conn.(*net.TCPConn); ok {
@@ -871,10 +926,7 @@ func (g *Guard) serveDNSUDPConn(ctx context.Context, conn net.PacketConn, backen
 			continue
 		}
 		now := time.Now()
-		if g.states.getOrCreate(source, now, g.cfg.Rate, g.cfg.Burst) == nil {
-			continue
-		}
-		if !g.states.allow(source, now, g.cfg.Rate, g.cfg.Burst) {
+		if !g.states.admitOrAllow(source, now, g.cfg.Rate, g.cfg.Burst) {
 			continue
 		}
 		if !g.acquireRequest() {
