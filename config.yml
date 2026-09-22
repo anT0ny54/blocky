@@ -14,12 +14,12 @@ bootstrapDns:
   - tcp+udp:1.1.1.1
   - tcp+udp:8.8.8.8
 
-# Do not enable DNS port 53 on SnapDeploy.
-# The HTTPS reverse proxy will reach Blocky through port 4000.
+# SnapDeploy exposes the HTTP listener only. Keep DNS available on loopback
+# solely for Blocky's built-in container healthcheck; it is not publicly bound.
 ports:
+  dns: 127.0.0.1:5300
   http: 4000
-
-dohPath: /dns-query
+  dohPath: /dns-query
 
 # SnapDeploy deployments are expected to have IPv4 egress.
 connectIPVersion: v4
@@ -44,9 +44,6 @@ rateLimit:
 log:
   level: info
 
-# Query logging is intentionally disabled: the "queryLog" section is
-# omitted entirely (no type/target configured), so Blocky never persists
-# per-query logs. This is a separate concern from the "log" level above,
-# which only controls general application log verbosity.
+# Query logging is intentionally disabled.
 queryLog:
   type: none

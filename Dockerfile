@@ -1,10 +1,10 @@
-FROM spx01/blocky:v0.33.0
+# Pin the Blocky runtime to the reviewed v0.35.0 release.
+FROM spx01/blocky:v0.35.0
 
 COPY config.yml /app/config.yml
 
+# SnapDeploy exposes the HTTP listener for DoH.
 EXPOSE 4000
 
-# Blocky ships its own healthcheck subcommand which queries the local
-# DoH/HTTP listener; use it instead of a raw curl/wget probe.
-HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
-  CMD ["/app/blocky", "healthcheck"]
+# Inherit Blocky's native healthcheck from the pinned base image. It follows
+# ports.dns from the config; the config keeps that listener on loopback:5300.

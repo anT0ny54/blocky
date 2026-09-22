@@ -4,17 +4,20 @@ A minimal public DNS-over-HTTPS (DoH) service built for small SnapDeploy instanc
 
 ## Runtime
 
-- Container image: `spx01/blocky:latest`
-- HTTP listener: `4000`
+- Container image: `spx01/blocky:v0.35.0`
+- Public HTTP listener: `4000`
 - DoH path: `/dns-query`
+- DNS listener: loopback-only `127.0.0.1:5300` for the container healthcheck; DNS is not publicly exposed and port `53` is not used
 - Outbound connections: IPv4 only
-- DNS-over-53: intentionally not enabled for SnapDeploy
 - Upstreams: three HaGeZi full-protection DoH resolvers
 - Cache: bounded to 4096 entries
 - Prefetching: disabled to avoid unnecessary upstream traffic
 - Per-client rate limiting: enabled
 - Query logging: disabled
-- Prometheus metrics: disabled; the public port is reserved for DoH
+- Prometheus metrics: disabled
+- Statistics collection: disabled
+
+The public HTTP listener is intentionally used for DoH. Keep the deployment's reverse proxy restricted to the intended DoH route and do not publish the loopback DNS listener.
 
 ## Free DNS Services
 
@@ -39,6 +42,7 @@ See the [HaGeZi DNS server documentation](https://github.com/hagezi/dns-servers)
 
 The service uses `config.yml` as its single Blocky configuration file. The YAML schema comment at the top of the file enables editor validation against Blocky's configuration schema.
 
+The configuration deliberately separates the public DoH listener from the DNS healthcheck listener: Blocky listens for DNS only on `127.0.0.1:5300`, while SnapDeploy serves the HTTP/DoH listener on port `4000`.
 
 ## License
 
