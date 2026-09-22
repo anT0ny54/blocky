@@ -1,0 +1,42 @@
+upstreams:
+  groups:
+    default:
+      - https://root.hagezi.org/dns-query
+      - https://wurzn.hagezi.org/dns-query
+      - https://juuri.hagezi.org/dns-query
+
+  strategy: parallel_best
+  timeout: 2s
+
+bootstrapDns:
+  - tcp+udp:1.1.1.1
+  - tcp+udp:8.8.8.8
+
+# Do not enable DNS port 53 on SnapDeploy.
+# The HTTPS reverse proxy will reach Blocky through port 4000.
+ports:
+  http: 4000
+
+dohPath: /dns-query
+
+connectIPVersion: v4
+
+caching:
+  minTime: 5m
+  maxTime: 1h
+  prefetching: true
+
+prometheus:
+  enable: true
+  path: /metrics
+
+# Abuse protection for individual client IPs.
+rateLimit:
+  enable: true
+  rate: 25
+  burst: 50
+  ipv4Prefix: 32
+  ipv6Prefix: 64
+
+log:
+  level: info
