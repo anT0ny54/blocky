@@ -564,6 +564,14 @@ func (g *Guard) Handler() http.Handler {
 		defer g.releaseRequest()
 
 		if r.URL.Path != g.cfg.DOHPath || (r.Method != http.MethodGet && r.Method != http.MethodPost) {
+			// Answer platform health/readiness probes (e.g. SnapDeploy's wake
+			// check hitting "/") instead of silently hijacking and closing the
+			// connection. Only a cheap, static 200 on GET "/" with no body is
+			// exempted; everything else still gets dropped.
+			if r.URL.Path == "/" && r.Method == http.MethodGet {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
 			g.dropHTTP(w)
 			return
 		}
