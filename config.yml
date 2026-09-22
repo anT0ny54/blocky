@@ -14,12 +14,12 @@ bootstrapDns:
   - tcp+udp:1.1.1.1
   - tcp+udp:8.8.8.8
 
-# The Go abuse guard owns the public HTTP listener on 4000 and forwards DoH to
-# Blocky over loopback. Keep DNS available on loopback solely for Blocky's
+# The Go abuse guard owns the public HTTP listener on 4001 and forwards DoH to
+# Blocky over loopback on 4002. Keep DNS available on loopback solely for Blocky's
 # built-in container healthcheck; it is not publicly bound.
 ports:
   dns: 127.0.0.1:5300
-  http: 127.0.0.1:4001
+  http: 127.0.0.1:4002
   dohPath: /dns-query
 
 # SnapDeploy deployments are expected to have IPv4 egress.

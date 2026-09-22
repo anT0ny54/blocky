@@ -20,7 +20,7 @@ COPY config.yml /app/config.yml
 COPY --from=guard-build /guard /app/guard
 
 # SnapDeploy exposes only the guarded public DoH listener.
-EXPOSE 4000
+EXPOSE 4001
 
 # The guard launches Blocky on loopback and owns the public listener.
 ENTRYPOINT ["/app/guard"]
