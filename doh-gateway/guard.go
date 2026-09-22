@@ -23,8 +23,8 @@ import (
 )
 
 const (
-	defaultListenAddr       = ":4000"
-	defaultBackendHTTP      = "127.0.0.1:4001"
+	defaultListenAddr       = ":4001"
+	defaultBackendHTTP      = "127.0.0.1:4002"
 	defaultDohPath          = "/dns-query"
 	defaultRate             = 10.0
 	defaultBurst            = 20.0
