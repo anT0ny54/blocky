@@ -1,3 +1,5 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/0xERR0R/blocky/main/docs/config.schema.json
+
 upstreams:
   groups:
     default:
@@ -5,7 +7,7 @@ upstreams:
       - https://wurzn.hagezi.org/dns-query
       - https://juuri.hagezi.org/dns-query
 
-  strategy: parallel_best
+  strategy: random
   timeout: 2s
 
 bootstrapDns:
@@ -19,16 +21,17 @@ ports:
 
 dohPath: /dns-query
 
+# SnapDeploy deployments are expected to have IPv4 egress.
 connectIPVersion: v4
 
 caching:
   minTime: 5m
   maxTime: 1h
-  prefetching: true
-
-prometheus:
-  enable: true
-  path: /metrics
+  # Bound memory growth on the 512 MB instance.
+  maxItemsCount: 4096
+  # Prefetching improves latency but causes extra upstream traffic and memory use.
+  prefetching: false
+  cacheTimeNegative: 30m
 
 # Abuse protection for individual client IPs.
 rateLimit:
@@ -38,5 +41,6 @@ rateLimit:
   ipv4Prefix: 32
   ipv6Prefix: 64
 
+# Query logging is intentionally disabled.
 log:
   level: info
