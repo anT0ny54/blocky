@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"hash/maphash"
 	"io"
+	"math"
 	"mime"
 	"net"
 	"net/http"
@@ -106,7 +107,7 @@ func loadGuardConfig() GuardConfig {
 	c.MaxPerIPConns = int32(envInt64("GUARD_MAX_IP_CONNS", int64(c.MaxPerIPConns)))
 	c.MaxSourceStates = int(envInt64("GUARD_MAX_IP_STATES", int64(c.MaxSourceStates)))
 	c.MaxDNSMessage = int(envInt64("GUARD_MAX_DNS_MESSAGE", int64(c.MaxDNSMessage)))
-	c.MaxQueriesPerConn = uint32(envInt64("GUARD_MAX_QUERIES_PER_CONN", int64(c.MaxQueriesPerConn)))
+	c.MaxQueriesPerConn = envUint32("GUARD_MAX_QUERIES_PER_CONN", c.MaxQueriesPerConn)
 	c.MaxConcurrentReqs = envInt64("GUARD_MAX_CONCURRENT_REQS", c.MaxConcurrentReqs)
 	c.StateIdle = envDuration("GUARD_STATE_IDLE", c.StateIdle)
 	c.ReadHeaderTimeout = envDuration("GUARD_READ_HEADER_TIMEOUT", c.ReadHeaderTimeout)
@@ -130,8 +131,13 @@ func (c *GuardConfig) normalize() {
 	if c.DOHPath == "" || c.DOHPath[0] != '/' {
 		c.DOHPath = defaultDohPath
 	}
-	if c.Rate <= 0 {
+	if c.Rate <= 0 || math.IsNaN(c.Rate) || math.IsInf(c.Rate, 0) {
 		c.Rate = defaultRate
+	}
+	if c.Burst <= 0 {
+		c.Burst = c.Rate
+	} else if math.IsNaN(c.Burst) || math.IsInf(c.Burst, 0) {
+		c.Burst = defaultBurst
 	}
 	if c.Burst < c.Rate {
 		c.Burst = c.Rate
@@ -211,6 +217,18 @@ func envFloat(name string, fallback float64) float64 {
 	return n
 }
 
+func envUint32(name string, fallback uint32) uint32 {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.ParseUint(v, 10, 32)
+	if err != nil {
+		return fallback
+	}
+	return uint32(n)
+}
+
 func envDuration(name string, fallback time.Duration) time.Duration {
 	v := strings.TrimSpace(os.Getenv(name))
 	if v == "" {
@@ -243,7 +261,7 @@ type sourceTable struct {
 	seed       maphash.Seed
 }
 
-func newSourceTable(maxStates int, _, _ float64) *sourceTable {
+func newSourceTable(maxStates int) *sourceTable {
 	if maxStates < 1 {
 		maxStates = 1
 	}
@@ -275,16 +293,8 @@ func (t *sourceTable) shard(key string) *stateShard {
 	return &t.shards[t.sourceHash(key)%uint64(t.shardCount)]
 }
 
-func (t *sourceTable) getOrCreate(key string, now time.Time, rate, burst float64) *clientState {
-	shardIdx := t.sourceHash(key) % uint64(t.shardCount)
+func (t *sourceTable) createLocked(shardIdx int, key string, now time.Time, burst float64) *clientState {
 	s := &t.shards[shardIdx]
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if st := s.clients[key]; st != nil {
-		st.lastSeen = now
-		return st
-	}
-
 	if len(s.clients) >= t.shardLimit[shardIdx] {
 		var victimKey string
 		var victim *clientState
@@ -293,23 +303,21 @@ func (t *sourceTable) getOrCreate(key string, now time.Time, rate, burst float64
 				continue
 			}
 			if now.Sub(candidate.lastSeen) >= t.stateIdle {
-				victimKey = k
-				victim = candidate
+				victimKey, victim = k, candidate
 				break
 			}
 			if victim == nil || candidate.lastSeen.Before(victim.lastSeen) {
-				victimKey = k
-				victim = candidate
+				victimKey, victim = k, candidate
 			}
 		}
-		if victim == nil || victim.conns != 0 {
+		if victim == nil {
 			return nil
 		}
 		delete(s.clients, victimKey)
 	}
-
-	s.clients[key] = &clientState{tokens: burst, last: now, lastSeen: now}
-	return s.clients[key]
+	st := &clientState{tokens: burst, last: now, lastSeen: now}
+	s.clients[key] = st
+	return st
 }
 
 func (t *sourceTable) allow(key string, now time.Time, rate, burst float64) bool {
@@ -336,7 +344,7 @@ func (t *sourceTable) allow(key string, now time.Time, rate, burst float64) bool
 	return true
 }
 
-// admitOrAllow performs the getOrCreate + token-bucket check under a single
+// admitOrAllow performs client creation and the token-bucket check under a single
 // shard lock, instead of two separate locked calls. This halves the mutex
 // acquisitions on the connectionless UDP path, where both steps run for
 // every inbound packet.
@@ -348,30 +356,10 @@ func (t *sourceTable) admitOrAllow(key string, now time.Time, rate, burst float6
 
 	st := s.clients[key]
 	if st == nil {
-		if len(s.clients) >= t.shardLimit[shardIdx] {
-			var victimKey string
-			var victim *clientState
-			for k, candidate := range s.clients {
-				if candidate.conns != 0 {
-					continue
-				}
-				if now.Sub(candidate.lastSeen) >= t.stateIdle {
-					victimKey = k
-					victim = candidate
-					break
-				}
-				if victim == nil || candidate.lastSeen.Before(victim.lastSeen) {
-					victimKey = k
-					victim = candidate
-				}
-			}
-			if victim == nil || victim.conns != 0 {
-				return false
-			}
-			delete(s.clients, victimKey)
+		st = t.createLocked(int(shardIdx), key, now, burst)
+		if st == nil {
+			return false
 		}
-		st = &clientState{tokens: burst, last: now, lastSeen: now}
-		s.clients[key] = st
 	}
 
 	elapsed := now.Sub(st.last).Seconds()
@@ -397,24 +385,10 @@ func (t *sourceTable) admitConn(key string, max int32, now time.Time, rate, burs
 	defer s.mu.Unlock()
 	st := s.clients[key]
 	if st == nil {
-		if len(s.clients) >= t.shardLimit[shardIdx] {
-			var victimKey string
-			var victim *clientState
-			for k, candidate := range s.clients {
-				if candidate.conns != 0 {
-					continue
-				}
-				if victim == nil || candidate.lastSeen.Before(victim.lastSeen) {
-					victimKey, victim = k, candidate
-				}
-			}
-			if victim == nil {
-				return nil, false
-			}
-			delete(s.clients, victimKey)
+		st = t.createLocked(int(shardIdx), key, now, burst)
+		if st == nil {
+			return nil, false
 		}
-		st = &clientState{tokens: burst, last: now, lastSeen: now}
-		s.clients[key] = st
 	}
 	st.lastSeen = now
 	if st.conns >= max {
@@ -435,7 +409,7 @@ func (t *sourceTable) releaseConn(key string) {
 
 func (t *sourceTable) stateCount() int {
 	n := 0
-	for i := range t.shards {
+	for i := 0; i < t.shardCount; i++ {
 		s := &t.shards[i]
 		s.mu.Lock()
 		n += len(s.clients)
@@ -455,20 +429,27 @@ type Guard struct {
 func NewGuard(cfg GuardConfig) *Guard {
 	cfg.normalize()
 	tr := &http.Transport{
-		Proxy:                 nil,
-		MaxConnsPerHost:       int(cfg.MaxGlobalConns),
-		MaxIdleConns:          16,
-		MaxIdleConnsPerHost:   8,
-		IdleConnTimeout:       20 * time.Second,
-		ResponseHeaderTimeout: cfg.BackendTimeout,
-		DisableCompression:    true,
+		Proxy:                  nil,
+		MaxConnsPerHost:        int(cfg.MaxConcurrentReqs),
+		MaxIdleConns:           16,
+		MaxIdleConnsPerHost:    8,
+		IdleConnTimeout:        20 * time.Second,
+		ResponseHeaderTimeout:  cfg.BackendTimeout,
+		MaxResponseHeaderBytes: int64(cfg.MaxHeaderBytes),
+		DisableCompression:     true,
 	}
-	states := newSourceTable(cfg.MaxSourceStates, cfg.Rate, cfg.Burst)
+	states := newSourceTable(cfg.MaxSourceStates)
 	states.stateIdle = cfg.StateIdle
 	return &Guard{
-		cfg:     cfg,
-		states:  states,
-		backend: &http.Client{Transport: tr, Timeout: cfg.BackendTimeout},
+		cfg:    cfg,
+		states: states,
+		backend: &http.Client{
+			Transport: tr,
+			Timeout:   cfg.BackendTimeout,
+			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
 	}
 }
 
@@ -535,7 +516,6 @@ type trackedConn struct {
 	source   string
 	released sync.Once
 	queries  atomic.Uint32
-	state    *clientState
 }
 
 func (c *trackedConn) Close() error {
@@ -556,9 +536,8 @@ func (c *trackedConn) nextQuery(max uint32) bool {
 }
 
 type guardedListener struct {
-	inner  net.Listener
-	guard  *Guard
-	closed atomic.Bool
+	inner net.Listener
+	guard *Guard
 }
 
 func (l *guardedListener) Accept() (net.Conn, error) {
@@ -577,7 +556,7 @@ func (l *guardedListener) Accept() (net.Conn, error) {
 			_ = conn.Close()
 			continue
 		}
-		state, ok := l.guard.states.admitConn(source, l.guard.cfg.MaxPerIPConns, time.Now(), l.guard.cfg.Rate, l.guard.cfg.Burst)
+		_, ok = l.guard.states.admitConn(source, l.guard.cfg.MaxPerIPConns, time.Now(), l.guard.cfg.Rate, l.guard.cfg.Burst)
 		if !ok {
 			_ = conn.Close()
 			l.guard.releaseGlobal()
@@ -587,12 +566,11 @@ func (l *guardedListener) Accept() (net.Conn, error) {
 			_ = tcp.SetKeepAlive(true)
 			_ = tcp.SetKeepAlivePeriod(30 * time.Second)
 		}
-		return &trackedConn{Conn: conn, guard: l.guard, source: source, state: state}, nil
+		return &trackedConn{Conn: conn, guard: l.guard, source: source}, nil
 	}
 }
 
 func (l *guardedListener) Close() error {
-	l.closed.Store(true)
 	return l.inner.Close()
 }
 
@@ -647,12 +625,15 @@ func (g *Guard) Handler() http.Handler {
 		if r.Method == http.MethodPost {
 			requestBody = bytes.NewReader(body)
 		}
-		backendReq, err := http.NewRequestWithContext(ctx, r.Method, "http://"+g.cfg.BackendHTTP+r.URL.RequestURI(), requestBody)
+		backendURI := g.cfg.DOHPath
+		if r.Method == http.MethodGet {
+			backendURI += "?dns=" + base64.RawURLEncoding.EncodeToString(body)
+		}
+		backendReq, err := http.NewRequestWithContext(ctx, r.Method, "http://"+g.cfg.BackendHTTP+backendURI, requestBody)
 		if err != nil {
 			g.dropHTTP(w)
 			return
 		}
-		backendReq.Host = r.Host
 		backendReq.Header.Set("X-Forwarded-For", state.source)
 		if accept := r.Header.Get("Accept"); accept != "" {
 			backendReq.Header.Set("Accept", accept)
@@ -671,7 +652,11 @@ func (g *Guard) Handler() http.Handler {
 			g.dropHTTP(w)
 			return
 		}
+		hopByHop := responseHopByHopHeaders(resp.Header)
 		for k, values := range resp.Header {
+			if _, ok := hopByHop[http.CanonicalHeaderKey(k)]; ok {
+				continue
+			}
 			for _, value := range values {
 				w.Header().Add(k, value)
 			}
@@ -680,6 +665,31 @@ func (g *Guard) Handler() http.Handler {
 		_, _ = io.CopyN(w, resp.Body, g.cfg.MaxResponseBytes)
 
 	})
+}
+
+func responseHopByHopHeaders(headers http.Header) map[string]struct{} {
+	hopByHop := make(map[string]struct{}, 8)
+	for _, name := range []string{
+		"connection",
+		"keep-alive",
+		"proxy-authenticate",
+		"proxy-authorization",
+		"te",
+		"trailer",
+		"transfer-encoding",
+		"upgrade",
+	} {
+		hopByHop[http.CanonicalHeaderKey(name)] = struct{}{}
+	}
+	for _, value := range headers.Values("Connection") {
+		for _, token := range strings.Split(value, ",") {
+			token = strings.TrimSpace(token)
+			if token != "" {
+				hopByHop[http.CanonicalHeaderKey(token)] = struct{}{}
+			}
+		}
+	}
+	return hopByHop
 }
 
 func (g *Guard) readDoHBody(r *http.Request) ([]byte, error) {
@@ -812,6 +822,11 @@ func (g *Guard) handleDNSTCP(ctx context.Context, conn net.Conn, backendAddr str
 			return
 		}
 		var hdr [2]byte
+		// Bound the wait for the next query's length header. Without this, a
+		// client that opens a connection and never sends data holds a global
+		// and per-IP connection slot open indefinitely, since this raw framing
+		// loop runs outside http.Server and gets none of its idle timeouts.
+		_ = conn.SetReadDeadline(time.Now().Add(g.cfg.IdleTimeout))
 		if _, err := io.ReadFull(conn, hdr[:]); err != nil {
 			return
 		}
