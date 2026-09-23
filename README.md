@@ -17,7 +17,7 @@ A minimal public DNS-over-HTTPS (DoH) service built for small SnapDeploy instanc
 - Prometheus metrics: disabled
 - Statistics collection: disabled
 
-The public HTTP listener is intentionally used for DoH. Keep the deployment's reverse proxy restricted to the intended DoH route and do not publish the loopback DNS listener.
+The Go guard owns the public DoH listener on port `4001` and forwards only normalized DoH traffic to Blocky on loopback port `4002`. Keep the deployment's reverse proxy restricted to the intended DoH route and do not publish either loopback listener.
 
 ## Free DNS Services
 
@@ -49,6 +49,21 @@ The configuration deliberately separates the public DoH listener from Blocky's i
 
 See [`LICENSE`](LICENSE).
 
+
+## 🌐 Free DNS Services
+
+High-performance DNS utilizing HaGeZi Blocklists (Multi Pro + TIF).
+
+| Blocklist | DNS-over-HTTPS (DoH) |
+| :--- | :--- |
+| Multi Pro + TIF | `https://freedns.koyeb.app/dns-query` (Recommended) |
+| Multi Pro + TIF | `https://dns-pi.vercel.app/api/doh/dns-query` (Recommended) |
+| Multi Pro + TIF | `https://dnssix.netlify.app/api/doh/dns-query` |
+| Multi Pro + TIF | `https://dns-93aca.containers.snapdeploy.app/dns-query` (Recommended, but will sleep if not use in 15 minute) |
+| Multi Pro + TIF | `https://doh-93aca.containers.snapdeploy.app/dns-query` (Recommended, but will sleep if not use in 15 minute) |
+
+---
+
 # ⚡ Bandwidth Hero Server
 
 A lightweight image optimization proxy designed to slash bandwidth usage and accelerate web browsing.
@@ -61,4 +76,3 @@ Bandwidth Hero Server fetches remote images, compresses them on the fly, and del
 
 If you find this project useful, donations are appreciated:
 - **Bitcoin**: `1HntwKxyqGCfnSGvGLMUTRAqLnTvLarAQP`
-
