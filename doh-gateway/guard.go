@@ -321,47 +321,17 @@ func (t *sourceTable) createLocked(shardIdx int, key string, now time.Time, burs
 }
 
 func (t *sourceTable) allow(key string, now time.Time, rate, burst float64) bool {
-	s := t.shard(key)
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	st := s.clients[key]
-	if st == nil {
-		// Rate buckets are separate from connection accounting so the public
-		// quota can use client IP + Host while connections remain per IP.
-		st = t.createLocked(int(t.sourceHash(key)%uint64(t.shardCount)), key, now, burst)
-		if st == nil {
-			return false
-		}
-	}
-	elapsed := now.Sub(st.last).Seconds()
-	if elapsed > 0 {
-		st.tokens += elapsed * rate
-		if st.tokens > burst {
-			st.tokens = burst
-		}
-		st.last = now
-	}
-	st.lastSeen = now
-	if st.tokens < 1 {
-		return false
-	}
-	st.tokens--
-	return true
-}
-
-// admitOrAllow performs client creation and the token-bucket check under a single
-// shard lock, instead of two separate locked calls. This halves the mutex
-// acquisitions on the connectionless UDP path, where both steps run for
-// every inbound packet.
-func (t *sourceTable) admitOrAllow(key string, now time.Time, rate, burst float64) bool {
 	shardIdx := t.sourceHash(key) % uint64(t.shardCount)
 	s := &t.shards[shardIdx]
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return t.allowLocked(s, int(shardIdx), key, now, rate, burst)
+}
 
+func (t *sourceTable) allowLocked(s *stateShard, shardIdx int, key string, now time.Time, rate, burst float64) bool {
 	st := s.clients[key]
 	if st == nil {
-		st = t.createLocked(int(shardIdx), key, now, burst)
+		st = t.createLocked(shardIdx, key, now, burst)
 		if st == nil {
 			return false
 		}
@@ -490,52 +460,16 @@ func (g *Guard) releaseGlobal() {
 	g.globalCon.Add(-1)
 }
 
-// canonicalHost normalizes the HTTP Host header so an IP + Host budget does
-// not fragment across case differences, a trailing DNS dot, or an explicit port.
-func canonicalHost(hostport string) string {
-	hostport = strings.TrimSpace(strings.ToLower(hostport))
-	if hostport == "" {
-		return "<empty>"
-	}
-	if host, _, err := net.SplitHostPort(hostport); err == nil {
-		hostport = host
-	} else if strings.HasPrefix(hostport, "[") && strings.HasSuffix(hostport, "]") {
-		hostport = strings.TrimSuffix(strings.TrimPrefix(hostport, "["), "]")
-	}
-	hostport = strings.TrimSuffix(hostport, ".")
-	if hostport == "" {
-		return "<empty>"
-	}
-	return hostport
-}
-
-func sourceRateKey(source, hostport string) string {
-	return source + "\x00" + canonicalHost(hostport)
-}
-
 func sourceKey(addr net.Addr) (string, bool) {
-	switch a := addr.(type) {
-	case *net.TCPAddr:
-		if a.IP == nil {
-			return "", false
-		}
-		ip := a.IP
-		if v4 := ip.To4(); v4 != nil {
-			ip = v4
-		}
-		return ip.String(), true
-	case *net.UDPAddr:
-		if a.IP == nil {
-			return "", false
-		}
-		ip := a.IP
-		if v4 := ip.To4(); v4 != nil {
-			ip = v4
-		}
-		return ip.String(), true
-	default:
+	a, ok := addr.(*net.TCPAddr)
+	if !ok || a.IP == nil {
 		return "", false
 	}
+	ip := a.IP
+	if v4 := ip.To4(); v4 != nil {
+		ip = v4
+	}
+	return ip.String(), true
 }
 
 type trackedConn struct {
@@ -614,8 +548,7 @@ func (g *Guard) Handler() http.Handler {
 			g.dropHTTP(w)
 			return
 		}
-		rateKey := sourceRateKey(state.source, r.Host)
-		if !g.states.allow(rateKey, time.Now(), g.cfg.Rate, g.cfg.Burst) {
+		if !g.states.allow(state.source, time.Now(), g.cfg.Rate, g.cfg.Burst) {
 			g.dropHTTP(w)
 			return
 		}
@@ -681,6 +614,11 @@ func (g *Guard) Handler() http.Handler {
 			g.dropHTTP(w)
 			return
 		}
+		responseBody, err := io.ReadAll(io.LimitReader(resp.Body, g.cfg.MaxResponseBytes+1))
+		if err != nil || int64(len(responseBody)) > g.cfg.MaxResponseBytes {
+			g.dropHTTP(w)
+			return
+		}
 		hopByHop := responseHopByHopHeaders(resp.Header)
 		for k, values := range resp.Header {
 			if _, ok := hopByHop[http.CanonicalHeaderKey(k)]; ok {
@@ -691,7 +629,7 @@ func (g *Guard) Handler() http.Handler {
 			}
 		}
 		w.WriteHeader(resp.StatusCode)
-		_, _ = io.CopyN(w, resp.Body, g.cfg.MaxResponseBytes)
+		_, _ = w.Write(responseBody)
 
 	})
 }
@@ -799,205 +737,6 @@ func (g *Guard) Run(ctx context.Context) error {
 		return err
 	}
 	return nil
-}
-
-// ServeDNSTCP provides the requested TCP DNS framing/connection guard for
-// deployments that need a raw DNS front-end. It is not enabled by default in
-// this SnapDeploy build because the public service is DoH-only.
-func (g *Guard) ServeDNSTCP(ctx context.Context, listenAddr, backendAddr string) error {
-	ln, err := net.Listen("tcp", listenAddr)
-	if err != nil {
-		return err
-	}
-	defer ln.Close()
-	go func() {
-		<-ctx.Done()
-		_ = ln.Close()
-	}()
-	gl := &guardedListener{inner: ln, guard: g}
-	for {
-		conn, err := gl.Accept()
-		if err != nil {
-			select {
-			case <-ctx.Done():
-				return nil
-			default:
-			}
-			if errors.Is(err, net.ErrClosed) {
-				return nil
-			}
-			return err
-		}
-		go g.handleDNSTCP(ctx, conn, backendAddr)
-	}
-}
-
-func (g *Guard) handleDNSTCP(ctx context.Context, conn net.Conn, backendAddr string) {
-	defer conn.Close()
-	state, ok := conn.(*trackedConn)
-	if !ok {
-		return
-	}
-
-	var backend net.Conn
-	defer func() {
-		if backend != nil {
-			_ = backend.Close()
-		}
-	}()
-
-	for {
-		if !state.nextQuery(g.cfg.MaxQueriesPerConn) || !g.states.allow(state.source, time.Now(), g.cfg.Rate, g.cfg.Burst) {
-			return
-		}
-		var hdr [2]byte
-		// Bound the wait for the next query's length header. Without this, a
-		// client that opens a connection and never sends data holds a global
-		// and per-IP connection slot open indefinitely, since this raw framing
-		// loop runs outside http.Server and gets none of its idle timeouts.
-		_ = conn.SetReadDeadline(time.Now().Add(g.cfg.IdleTimeout))
-		if _, err := io.ReadFull(conn, hdr[:]); err != nil {
-			return
-		}
-		frameLen := int(hdr[0])<<8 | int(hdr[1])
-		// Reject the length field before allocating or dialing the backend.
-		if frameLen == 0 || frameLen > g.cfg.MaxDNSMessage {
-			return
-		}
-		frame := make([]byte, frameLen)
-		_ = conn.SetReadDeadline(time.Now().Add(g.cfg.ReadTimeout))
-		if _, err := io.ReadFull(conn, frame); err != nil {
-			return
-		}
-
-		if !g.acquireRequest() {
-			return
-		}
-		stop := false
-		func() {
-			defer g.releaseRequest()
-			if backend == nil {
-				var err error
-				backend, err = net.DialTimeout("tcp", backendAddr, g.cfg.BackendTimeout)
-				if err != nil {
-					stop = true
-					return
-				}
-			}
-			_ = backend.SetDeadline(time.Now().Add(g.cfg.BackendTimeout))
-			if _, err := backend.Write(hdr[:]); err != nil {
-				stop = true
-				return
-			}
-			if _, err := backend.Write(frame); err != nil {
-				stop = true
-				return
-			}
-			if _, err := io.ReadFull(backend, hdr[:]); err != nil {
-				stop = true
-				return
-			}
-			respLen := int(hdr[0])<<8 | int(hdr[1])
-			if respLen == 0 || respLen > g.cfg.MaxDNSMessage {
-				stop = true
-				return
-			}
-			resp := make([]byte, respLen)
-			if _, err := io.ReadFull(backend, resp); err != nil {
-				stop = true
-				return
-			}
-			_ = conn.SetWriteDeadline(time.Now().Add(g.cfg.WriteTimeout))
-			if _, err := conn.Write(hdr[:]); err != nil {
-				stop = true
-				return
-			}
-			if _, err := conn.Write(resp); err != nil {
-				stop = true
-				return
-			}
-		}()
-		if stop {
-			return
-		}
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-	}
-}
-
-// ServeDNSUDP provides a silent-drop UDP guard. Oversized, rate-limited, or
-// globally saturated packets are dropped without a response.
-func (g *Guard) ServeDNSUDP(ctx context.Context, listenAddr, backendAddr string) error {
-	conn, err := net.ListenPacket("udp", listenAddr)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	return g.serveDNSUDPConn(ctx, conn, backendAddr)
-}
-
-func (g *Guard) serveDNSUDPConn(ctx context.Context, conn net.PacketConn, backendAddr string) error {
-	go func() {
-		<-ctx.Done()
-		_ = conn.Close()
-	}()
-	bufSize := g.cfg.MaxDNSMessage + 1
-	if bufSize < 64 {
-		bufSize = 64
-	}
-	buf := make([]byte, bufSize)
-	for {
-		n, client, err := conn.ReadFrom(buf)
-		if err != nil {
-			select {
-			case <-ctx.Done():
-				return nil
-			default:
-			}
-			if errors.Is(err, net.ErrClosed) {
-				return nil
-			}
-			return err
-		}
-		if n == 0 || n > g.cfg.MaxDNSMessage {
-			continue
-		}
-		source, ok := sourceKey(client)
-		if !ok {
-			continue
-		}
-		now := time.Now()
-		if !g.states.admitOrAllow(source, now, g.cfg.Rate, g.cfg.Burst) {
-			continue
-		}
-		if !g.acquireRequest() {
-			continue
-		}
-		packet := append([]byte(nil), buf[:n]...)
-		go func() {
-			defer g.releaseRequest()
-			deadline := time.Now().Add(g.cfg.BackendTimeout)
-			backend, err := net.DialTimeout("udp", backendAddr, g.cfg.BackendTimeout)
-			if err != nil {
-				return
-			}
-			defer backend.Close()
-			_ = backend.SetDeadline(deadline)
-			if _, err := backend.Write(packet); err != nil {
-				return
-			}
-			resp := make([]byte, g.cfg.MaxDNSMessage+1)
-			m, err := backend.Read(resp)
-			if err != nil || m == 0 || m > g.cfg.MaxDNSMessage {
-				return
-			}
-			_ = conn.SetWriteDeadline(time.Now().Add(g.cfg.WriteTimeout))
-			_, _ = conn.WriteTo(resp[:m], client)
-		}()
-	}
 }
 
 func runHealthcheck() error {

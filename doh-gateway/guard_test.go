@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"io"
 	"math"
 	"net"
 	"net/http"
@@ -19,7 +18,7 @@ func TestSourceTableIsBounded(t *testing.T) {
 	now := time.Now()
 	for i := 0; i < 1000; i++ {
 		key := "192.0.2." + strconvItoa(i%250)
-		_ = table.admitOrAllow(key, now.Add(time.Duration(i)*time.Millisecond), 10, 20)
+		_ = table.allow(key, now.Add(time.Duration(i)*time.Millisecond), 10, 20)
 	}
 	if got := table.stateCount(); got > 128 {
 		t.Fatalf("state table exceeded bound: got %d", got)
@@ -43,7 +42,7 @@ func TestDefaultBurstAllows80ImmediateRequests(t *testing.T) {
 	cfg := defaultGuardConfig()
 	table := newSourceTable(64)
 	now := time.Unix(1000, 0)
-	key := sourceRateKey("198.51.100.30", "dns.example.com")
+	key := "198.51.100.30"
 	for i := 0; i < 80; i++ {
 		if !table.allow(key, now, cfg.Rate, cfg.Burst) {
 			t.Fatalf("request %d of 80 was rejected", i+1)
@@ -58,46 +57,33 @@ func TestTokenBucketRateAndBurst(t *testing.T) {
 	table := newSourceTable(64)
 	now := time.Now()
 	key := "198.51.100.7"
-	if !table.admitOrAllow(key, now, 10, 2) {
+	if !table.allow(key, now, 10, 2) {
 		t.Fatal("first token was rejected")
 	}
-	if !table.admitOrAllow(key, now, 10, 2) {
+	if !table.allow(key, now, 10, 2) {
 		t.Fatal("burst token was rejected")
 	}
-	if table.admitOrAllow(key, now, 10, 2) {
+	if table.allow(key, now, 10, 2) {
 		t.Fatal("third immediate token should be rejected")
 	}
-	if !table.admitOrAllow(key, now.Add(100*time.Millisecond), 10, 2) {
+	if !table.allow(key, now.Add(100*time.Millisecond), 10, 2) {
 		t.Fatal("refilled token was rejected")
 	}
 }
 
-func TestSourceRateKeyIncludesCanonicalHost(t *testing.T) {
-	if got := sourceRateKey("203.0.113.9", "DNS.Example.COM:443"); got != "203.0.113.9\x00dns.example.com" {
-		t.Fatalf("canonical rate key = %q", got)
-	}
-	if got := sourceRateKey("203.0.113.9", "dns.example.com."); got != "203.0.113.9\x00dns.example.com" {
-		t.Fatalf("trailing-dot rate key = %q", got)
-	}
-	if got := sourceRateKey("203.0.113.9", "other.example.com"); got == sourceRateKey("203.0.113.9", "dns.example.com") {
-		t.Fatal("different hosts must use different rate buckets")
-	}
-}
-
-func TestSourceRateBucketsArePerIPAndHost(t *testing.T) {
+func TestSourceRateBucketsArePerIP(t *testing.T) {
 	table := newSourceTable(64)
 	now := time.Unix(1000, 0)
-	a := sourceRateKey("198.51.100.20", "one.example")
-	b := sourceRateKey("198.51.100.20", "two.example")
+	key := "198.51.100.20"
 
-	if !table.allow(a, now, 1, 1) {
-		t.Fatal("first request for host A was rejected")
+	if !table.allow(key, now, 1, 1) {
+		t.Fatal("first request was rejected")
 	}
-	if table.allow(a, now, 1, 1) {
-		t.Fatal("second immediate request for host A should be rejected")
+	if table.allow(key, now, 1, 1) {
+		t.Fatal("second immediate request should be rejected")
 	}
-	if !table.allow(b, now, 1, 1) {
-		t.Fatal("same IP on a different host should have its own bucket")
+	if !table.allow(key, now.Add(time.Second), 1, 1) {
+		t.Fatal("rate bucket did not refill for the same source IP")
 	}
 }
 
@@ -264,140 +250,6 @@ func TestDoHProxySanitizesForwardedClientIP(t *testing.T) {
 	}
 }
 
-func TestDNSTCPFrameLimitClosesBeforeBackendDial(t *testing.T) {
-	cfg := defaultGuardConfig()
-	cfg.MaxDNSMessage = 64
-	g := NewGuard(cfg)
-	server, client := net.Pipe()
-	_, ok := g.states.admitConn("198.51.100.18", cfg.MaxPerIPConns, time.Now(), cfg.Rate, cfg.Burst)
-	if !ok {
-		t.Fatal("connection state admission failed")
-	}
-	if !g.admitGlobal() {
-		t.Fatal("global connection admission failed")
-	}
-	tracked := &trackedConn{Conn: server, guard: g, source: "198.51.100.18"}
-	done := make(chan struct{})
-	go func() {
-		g.handleDNSTCP(context.Background(), tracked, "127.0.0.1:1")
-		close(done)
-	}()
-	if _, err := client.Write([]byte{0x00, 0x41}); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("oversized DNS TCP frame did not close promptly")
-	}
-	_ = client.Close()
-	if got := g.globalCon.Load(); got != 0 {
-		t.Fatalf("global connection count leaked: %d", got)
-	}
-}
-
-func TestDNSTCPHeaderReadEnforcesIdleTimeout(t *testing.T) {
-	cfg := defaultGuardConfig()
-	cfg.IdleTimeout = 50 * time.Millisecond
-	g := NewGuard(cfg)
-	server, client := net.Pipe()
-	defer client.Close()
-	_, ok := g.states.admitConn("198.51.100.20", cfg.MaxPerIPConns, time.Now(), cfg.Rate, cfg.Burst)
-	if !ok {
-		t.Fatal("connection state admission failed")
-	}
-	if !g.admitGlobal() {
-		t.Fatal("global connection admission failed")
-	}
-	tracked := &trackedConn{Conn: server, guard: g, source: "198.51.100.20"}
-	done := make(chan struct{})
-	go func() {
-		// Client never writes anything: a missing read deadline on the header
-		// read would hang here forever instead of the idle timeout firing.
-		g.handleDNSTCP(context.Background(), tracked, "127.0.0.1:1")
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("idle connection with no header data was not closed by the read deadline")
-	}
-	if got := g.globalCon.Load(); got != 0 {
-		t.Fatalf("global connection count leaked: %d", got)
-	}
-}
-
-func TestDNSTCPRejectsOversizedBackendResponse(t *testing.T) {
-	cfg := defaultGuardConfig()
-	cfg.MaxDNSMessage = 64
-	cfg.BackendTimeout = time.Second
-	g := NewGuard(cfg)
-
-	backendLn, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer backendLn.Close()
-	backendDone := make(chan struct{})
-	go func() {
-		defer close(backendDone)
-		conn, err := backendLn.Accept()
-		if err != nil {
-			return
-		}
-		defer conn.Close()
-		var hdr [2]byte
-		if _, err := io.ReadFull(conn, hdr[:]); err != nil {
-			return
-		}
-		frameLen := int(hdr[0])<<8 | int(hdr[1])
-		frame := make([]byte, frameLen)
-		if _, err := io.ReadFull(conn, frame); err != nil {
-			return
-		}
-		// Send a legal DNS-over-TCP length field that exceeds the guard limit.
-		hdr[0], hdr[1] = 0x01, 0x00
-		_, _ = conn.Write(hdr[:])
-	}()
-
-	server, client := net.Pipe()
-	_, ok := g.states.admitConn("198.51.100.19", cfg.MaxPerIPConns, time.Now(), cfg.Rate, cfg.Burst)
-	if !ok {
-		t.Fatal("connection state admission failed")
-	}
-	if !g.admitGlobal() {
-		t.Fatal("global connection admission failed")
-	}
-	tracked := &trackedConn{Conn: server, guard: g, source: "198.51.100.19"}
-	done := make(chan struct{})
-	go func() {
-		g.handleDNSTCP(context.Background(), tracked, backendLn.Addr().String())
-		close(done)
-	}()
-
-	query := make([]byte, 4)
-	query[0], query[1] = 0x00, 0x02
-	query[2], query[3] = 0x01, 0x02
-	if _, err := client.Write(query); err != nil {
-		t.Fatal(err)
-	}
-
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("oversized backend response did not close promptly")
-	}
-	_ = client.Close()
-	select {
-	case <-backendDone:
-	case <-time.After(time.Second):
-		t.Fatal("backend test server did not finish")
-	}
-	if got := g.globalCon.Load(); got != 0 {
-		t.Fatalf("global connection count leaked: %d", got)
-	}
-}
-
 func TestNormalizeClampsUnsafeValues(t *testing.T) {
 	cfg := GuardConfig{
 		Rate:              -1,
@@ -471,6 +323,52 @@ func TestEnvUint32RejectsOverflowAndNegative(t *testing.T) {
 	t.Setenv("GUARD_MAX_QUERIES_PER_CONN", "4294967295")
 	if got := envUint32("GUARD_MAX_QUERIES_PER_CONN", 50); got != math.MaxUint32 {
 		t.Fatalf("maximum uint32 env rejected: got %d", got)
+	}
+}
+
+func TestDoHRateLimitCannotBeFragmentedByHost(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/dns-message")
+		_, _ = w.Write([]byte{0x01, 0x02})
+	}))
+	defer backend.Close()
+
+	cfg := defaultGuardConfig()
+	cfg.Rate = 1
+	cfg.Burst = 1
+	cfg.BackendHTTP = strings.TrimPrefix(backend.URL, "http://")
+	g := NewGuard(cfg)
+	_, ok := g.states.admitConn("192.0.2.76", cfg.MaxPerIPConns, time.Now(), cfg.Rate, cfg.Burst)
+	if !ok {
+		t.Fatal("client state admission failed")
+	}
+	if !g.admitGlobal() {
+		t.Fatal("global connection admission failed")
+	}
+	defer func() {
+		g.states.releaseConn("192.0.2.76")
+		g.releaseGlobal()
+	}()
+
+	newRequest := func(host string) *http.Request {
+		req, err := http.NewRequest(http.MethodGet, "http://guard/dns-query?dns=AAE", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Host = host
+		return req.WithContext(context.WithValue(req.Context(), connStateKey{}, &trackedConn{source: "192.0.2.76", guard: g}))
+	}
+
+	w := httptest.NewRecorder()
+	g.Handler().ServeHTTP(w, newRequest("one.example"))
+	if w.Code != http.StatusOK {
+		t.Fatalf("first request status: %d", w.Code)
+	}
+
+	w = httptest.NewRecorder()
+	g.Handler().ServeHTTP(w, newRequest("two.example"))
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("second request with another Host bypassed rate limit: status=%d", w.Code)
 	}
 }
 
@@ -593,6 +491,42 @@ func TestDoHProxyRejectsOversizedBackendResponseHeaders(t *testing.T) {
 		t.Fatal(err)
 	}
 	req = req.WithContext(context.WithValue(req.Context(), connStateKey{}, &trackedConn{source: "192.0.2.79", guard: g}))
+	w := httptest.NewRecorder()
+	g.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("unexpected status: %d", w.Code)
+	}
+}
+
+func TestDoHProxyRejectsUnknownLengthOversizedBackendResponse(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/dns-message")
+		w.(http.Flusher).Flush()
+		_, _ = w.Write(bytes.Repeat([]byte{0x01}, 513))
+	}))
+	defer backend.Close()
+
+	cfg := defaultGuardConfig()
+	cfg.MaxResponseBytes = 512
+	cfg.BackendHTTP = strings.TrimPrefix(backend.URL, "http://")
+	g := NewGuard(cfg)
+	_, ok := g.states.admitConn("192.0.2.82", cfg.MaxPerIPConns, time.Now(), cfg.Rate, cfg.Burst)
+	if !ok {
+		t.Fatal("client state admission failed")
+	}
+	if !g.admitGlobal() {
+		t.Fatal("global connection admission failed")
+	}
+	defer func() {
+		g.states.releaseConn("192.0.2.82")
+		g.releaseGlobal()
+	}()
+
+	req, err := http.NewRequest(http.MethodGet, "http://guard/dns-query?dns=AAE", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req = req.WithContext(context.WithValue(req.Context(), connStateKey{}, &trackedConn{source: "192.0.2.82", guard: g}))
 	w := httptest.NewRecorder()
 	g.Handler().ServeHTTP(w, req)
 	if w.Code != http.StatusTooManyRequests {
@@ -745,48 +679,5 @@ func TestDoHProxyDoesNotForwardConnectionNominatedHeaders(t *testing.T) {
 	}
 	if got := w.Header().Get("Connection"); got != "" {
 		t.Fatalf("Connection response header leaked: %q", got)
-	}
-}
-
-func TestServeDNSUDPDropsOversizedPacketSilently(t *testing.T) {
-	cfg := defaultGuardConfig()
-	cfg.MaxDNSMessage = 64
-	cfg.BackendTimeout = 100 * time.Millisecond
-	cfg.WriteTimeout = 100 * time.Millisecond
-	g := NewGuard(cfg)
-
-	server, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer server.Close()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	done := make(chan error, 1)
-	go func() { done <- g.serveDNSUDPConn(ctx, server, "127.0.0.1:1") }()
-
-	client, err := net.Dial("udp", server.LocalAddr().String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer client.Close()
-	oversized := bytes.Repeat([]byte{0x7f}, cfg.MaxDNSMessage+1)
-	if _, err := client.Write(oversized); err != nil {
-		t.Fatal(err)
-	}
-	_ = client.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
-	buf := make([]byte, 512)
-	if _, err := client.Read(buf); err == nil {
-		t.Fatal("oversized UDP packet unexpectedly received a response")
-	}
-	cancel()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("UDP server returned error: %v", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("UDP server did not stop after cancellation")
 	}
 }
