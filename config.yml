@@ -37,8 +37,8 @@ caching:
 # Abuse protection for individual client IPs.
 rateLimit:
   enable: true
-  rate: 25
-  burst: 50
+  rate: 10
+  burst: 24
   ipv4Prefix: 32
   ipv6Prefix: 64
 
