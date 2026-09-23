@@ -28,17 +28,20 @@ connectIPVersion: v4
 caching:
   minTime: 5m
   maxTime: 1h
-  # Bound memory growth on the 512 MB instance.
-  maxItemsCount: 4096
+  # Larger bounded cache uses available RAM for more cache hits without
+  # making cache growth attacker-controlled.
+  maxItemsCount: 8192
   # Prefetching improves latency but causes extra upstream traffic and memory use.
   prefetching: false
   cacheTimeNegative: 30m
 
-# Abuse protection for individual client IPs.
+# Public DoH abuse protection is enforced by /app/guard using the client-IP +
+# Host token bucket. Keep Blocky's own resolver-chain limiter disabled so the
+# loopback hop cannot impose a second, host-agnostic quota.
 rateLimit:
-  enable: true
-  rate: 10
-  burst: 24
+  enable: false
+  rate: 0
+  burst: 1
   ipv4Prefix: 32
   ipv6Prefix: 64
 

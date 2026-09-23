@@ -10,7 +10,7 @@ A minimal public DNS-over-HTTPS (DoH) service built for small SnapDeploy instanc
 - DNS listener: loopback-only `127.0.0.1:5300` for the container healthcheck; DNS is not publicly exposed and port `53` is not used
 - Outbound connections: IPv4 only
 - Upstreams: three HaGeZi full-protection DoH resolvers
-- Cache: bounded to 4096 entries
+- Cache: bounded to 8192 entries
 - Prefetching: disabled to avoid unnecessary upstream traffic
 - Per-client rate limiting: enabled
 - Query logging: disabled
@@ -21,22 +21,24 @@ The Go guard owns the public DoH listener on port `4001` and forwards only norma
 
 ## Moderate resource and anti-abuse defaults
 
-The public guard and Blocky's own per-client limiter are aligned with the more-moderate MosDNS reference profile used for small 512 MB / 0.25 vCPU deployments. The higher burst allowance is intended to tolerate normal browser DNS startup bursts while retaining bounded abuse protection.
+The public guard uses a per-client-IP + Host token bucket equivalent to **100 requests per 60 seconds**, with a **80-request startup burst**. This is applied before Blocky; Blocky's internal resolver-chain limiter stays disabled so clients do not encounter a second, host-agnostic quota on the loopback hop.
 
 | Setting | Default | Equivalent/reference |
 | :--- | ---: | :--- |
-| `GUARD_RATE` | `10/s` | MosDNS `DOH_RATE_LIMIT=10` |
-| `GUARD_BURST` | `24` | MosDNS `DOH_RATE_BURST=24` |
-| `GUARD_MAX_IP_CONNS` | `12` | MosDNS `IP_CONN_LIMIT=12` |
-| `GUARD_MAX_GLOBAL_CONNS` | `96` | MosDNS `GLOBAL_CONN_LIMIT=96` |
-| `GUARD_MAX_CONCURRENT_REQS` | `64` | Gateway concurrency ceiling; Blocky has no separate global request-rate knob |
-| `GUARD_MAX_IP_STATES` | `512` | MosDNS `DOH_RATE_MAX_IPS=512` |
-| Blocky `rateLimit.rate` | `10/s` | Same client rate profile |
-| Blocky `rateLimit.burst` | `24` | Same client burst profile |
-| `caching.maxItemsCount` | `4096` | MosDNS `CACHE_SIZE=4096` |
-| `GOMEMLIMIT` | `256MiB` | Main Blocky/guard Go process target |
+| `GUARD_RATE` | `100/60s` (1.6667/s) | Per-client-IP + Host sustained rate |
+| `GUARD_BURST` | `80` | Browser-startup burst within the shared quota |
+| `GUARD_MAX_IP_CONNS` | `16` | Per-client-IP connection ceiling |
+| `GUARD_MAX_GLOBAL_CONNS` | `64` | Aggregate accept-time connection ceiling |
+| `GUARD_MAX_CONCURRENT_REQS` | `32` | Gateway concurrency ceiling for the 0.25 vCPU target |
+| `GUARD_MAX_IP_STATES` | `4096` | Fixed bounded state slots for IP + Host rate buckets |
+| `GUARD_MAX_QUERIES_PER_CONN` | `256` | Allows normal HTTP keep-alive/query reuse without a low artificial cap |
+| Blocky `rateLimit.enable` | `false` | Disabled to avoid a second host-agnostic quota on loopback |
+| Blocky `rateLimit.burst` | `1` | Inactive while Blocky's internal limiter is disabled |
+| `caching.maxItemsCount` | `8192` | Larger bounded cache for the 512 MB instance |
+| `GOMEMLIMIT` | `80MiB` | Public guard Go heap target; Blocky uses `BLOCKY_GOMEMLIMIT=288MiB` |
+| `BLOCKY_GOMEMLIMIT` | `288MiB` | Blocky child-process Go heap target |
 
-The guard runs before Blocky and rejects excess connections/requests before DNS parsing or backend work. `GOMEMLIMIT` is a soft Go heap target rather than a hard container-memory cap.
+The guard runs before Blocky and rejects excess connections/requests before DNS parsing or backend work. The DoH rate bucket is keyed by client IP + canonical Host, so multiple browsers/devices behind the same public IP share a host-specific 100/60-second budget. The 80-request burst is intended to absorb short browser-startup DNS bursts; it does not remove the 100/60-second sustained limit. `GOMEMLIMIT` is a soft per-process Go heap target rather than a hard container-memory cap.
 
 ## Free DNS Services
 
