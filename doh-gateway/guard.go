@@ -28,10 +28,10 @@ const (
 	defaultBackendHTTP      = "127.0.0.1:4002"
 	defaultDohPath          = "/dns-query"
 	defaultRate             = 10.0
-	defaultBurst            = 20.0
-	defaultGlobalConns      = 64
-	defaultPerIPConns       = 8
-	defaultMaxSourceStates  = 4096
+	defaultBurst            = 24.0
+	defaultGlobalConns      = 96
+	defaultPerIPConns       = 12
+	defaultMaxSourceStates  = 512
 	defaultMaxDNSMessage    = 4096
 	defaultMaxQueriesConn   = 50
 	defaultMaxHeaderBytes   = 16 << 10
@@ -42,7 +42,7 @@ const (
 	defaultWriteTimeout     = 10 * time.Second
 	defaultIdleTimeout      = 20 * time.Second
 	defaultBackendTimeout   = 5 * time.Second
-	defaultMaxRequests      = 32
+	defaultMaxRequests      = 64
 
 	stateShards = 64
 )
