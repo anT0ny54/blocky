@@ -27,13 +27,13 @@ const (
 	defaultListenAddr       = ":4001"
 	defaultBackendHTTP      = "127.0.0.1:4002"
 	defaultDohPath          = "/dns-query"
-	defaultRate             = 10.0
-	defaultBurst            = 24.0
-	defaultGlobalConns      = 96
-	defaultPerIPConns       = 12
-	defaultMaxSourceStates  = 512
+	defaultRate             = 100.0 / 60.0 // 100 requests per 60 seconds sustained
+	defaultBurst            = 80.0
+	defaultGlobalConns      = 64
+	defaultPerIPConns       = 16
+	defaultMaxSourceStates  = 4096
 	defaultMaxDNSMessage    = 4096
-	defaultMaxQueriesConn   = 50
+	defaultMaxQueriesConn   = 256
 	defaultMaxHeaderBytes   = 16 << 10
 	defaultResponseMaxBytes = 65535
 	defaultStateIdle        = 2 * time.Minute
@@ -42,7 +42,7 @@ const (
 	defaultWriteTimeout     = 10 * time.Second
 	defaultIdleTimeout      = 20 * time.Second
 	defaultBackendTimeout   = 5 * time.Second
-	defaultMaxRequests      = 64
+	defaultMaxRequests      = 32
 
 	stateShards = 64
 )
@@ -326,7 +326,12 @@ func (t *sourceTable) allow(key string, now time.Time, rate, burst float64) bool
 	defer s.mu.Unlock()
 	st := s.clients[key]
 	if st == nil {
-		return false
+		// Rate buckets are separate from connection accounting so the public
+		// quota can use client IP + Host while connections remain per IP.
+		st = t.createLocked(int(t.sourceHash(key)%uint64(t.shardCount)), key, now, burst)
+		if st == nil {
+			return false
+		}
 	}
 	elapsed := now.Sub(st.last).Seconds()
 	if elapsed > 0 {
@@ -485,6 +490,29 @@ func (g *Guard) releaseGlobal() {
 	g.globalCon.Add(-1)
 }
 
+// canonicalHost normalizes the HTTP Host header so an IP + Host budget does
+// not fragment across case differences, a trailing DNS dot, or an explicit port.
+func canonicalHost(hostport string) string {
+	hostport = strings.TrimSpace(strings.ToLower(hostport))
+	if hostport == "" {
+		return "<empty>"
+	}
+	if host, _, err := net.SplitHostPort(hostport); err == nil {
+		hostport = host
+	} else if strings.HasPrefix(hostport, "[") && strings.HasSuffix(hostport, "]") {
+		hostport = strings.TrimSuffix(strings.TrimPrefix(hostport, "["), "]")
+	}
+	hostport = strings.TrimSuffix(hostport, ".")
+	if hostport == "" {
+		return "<empty>"
+	}
+	return hostport
+}
+
+func sourceRateKey(source, hostport string) string {
+	return source + "\x00" + canonicalHost(hostport)
+}
+
 func sourceKey(addr net.Addr) (string, bool) {
 	switch a := addr.(type) {
 	case *net.TCPAddr:
@@ -586,7 +614,8 @@ func (g *Guard) Handler() http.Handler {
 			g.dropHTTP(w)
 			return
 		}
-		if !g.states.allow(state.source, time.Now(), g.cfg.Rate, g.cfg.Burst) {
+		rateKey := sourceRateKey(state.source, r.Host)
+		if !g.states.allow(rateKey, time.Now(), g.cfg.Rate, g.cfg.Burst) {
 			g.dropHTTP(w)
 			return
 		}
@@ -1024,6 +1053,14 @@ func main() {
 	blocky := exec.Command("/app/blocky")
 	blocky.Stdout = os.Stdout
 	blocky.Stderr = os.Stderr
+	// Keep the public guard's small heap target separate from Blocky's resolver
+	// and cache heap. Both processes inherit the container environment, so give
+	// the child its own explicit bounded target.
+	blockyGOMEMLIMIT := envString("BLOCKY_GOMEMLIMIT", "288MiB")
+	blocky.Env = append(os.Environ(),
+		"GOMEMLIMIT="+blockyGOMEMLIMIT,
+		"GOMAXPROCS=1",
+	)
 	if err := blocky.Start(); err != nil {
 		fmt.Fprintln(os.Stderr, "start blocky:", err)
 		os.Exit(1)

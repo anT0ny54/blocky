@@ -26,6 +26,34 @@ func TestSourceTableIsBounded(t *testing.T) {
 	}
 }
 
+func TestDefaultGuardRateAndBurst(t *testing.T) {
+	cfg := defaultGuardConfig()
+	if cfg.Rate != defaultRate {
+		t.Fatalf("default rate = %v, want %v", cfg.Rate, defaultRate)
+	}
+	if cfg.Burst != 80 {
+		t.Fatalf("default burst = %v, want 80", cfg.Burst)
+	}
+	if cfg.Burst < cfg.Rate {
+		t.Fatalf("default burst = %v is below default rate = %v", cfg.Burst, cfg.Rate)
+	}
+}
+
+func TestDefaultBurstAllows80ImmediateRequests(t *testing.T) {
+	cfg := defaultGuardConfig()
+	table := newSourceTable(64)
+	now := time.Unix(1000, 0)
+	key := sourceRateKey("198.51.100.30", "dns.example.com")
+	for i := 0; i < 80; i++ {
+		if !table.allow(key, now, cfg.Rate, cfg.Burst) {
+			t.Fatalf("request %d of 80 was rejected", i+1)
+		}
+	}
+	if table.allow(key, now, cfg.Rate, cfg.Burst) {
+		t.Fatal("81st immediate request was accepted; burst should be 80")
+	}
+}
+
 func TestTokenBucketRateAndBurst(t *testing.T) {
 	table := newSourceTable(64)
 	now := time.Now()
@@ -41,6 +69,35 @@ func TestTokenBucketRateAndBurst(t *testing.T) {
 	}
 	if !table.admitOrAllow(key, now.Add(100*time.Millisecond), 10, 2) {
 		t.Fatal("refilled token was rejected")
+	}
+}
+
+func TestSourceRateKeyIncludesCanonicalHost(t *testing.T) {
+	if got := sourceRateKey("203.0.113.9", "DNS.Example.COM:443"); got != "203.0.113.9\x00dns.example.com" {
+		t.Fatalf("canonical rate key = %q", got)
+	}
+	if got := sourceRateKey("203.0.113.9", "dns.example.com."); got != "203.0.113.9\x00dns.example.com" {
+		t.Fatalf("trailing-dot rate key = %q", got)
+	}
+	if got := sourceRateKey("203.0.113.9", "other.example.com"); got == sourceRateKey("203.0.113.9", "dns.example.com") {
+		t.Fatal("different hosts must use different rate buckets")
+	}
+}
+
+func TestSourceRateBucketsArePerIPAndHost(t *testing.T) {
+	table := newSourceTable(64)
+	now := time.Unix(1000, 0)
+	a := sourceRateKey("198.51.100.20", "one.example")
+	b := sourceRateKey("198.51.100.20", "two.example")
+
+	if !table.allow(a, now, 1, 1) {
+		t.Fatal("first request for host A was rejected")
+	}
+	if table.allow(a, now, 1, 1) {
+		t.Fatal("second immediate request for host A should be rejected")
+	}
+	if !table.allow(b, now, 1, 1) {
+		t.Fatal("same IP on a different host should have its own bucket")
 	}
 }
 
