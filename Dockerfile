@@ -25,5 +25,13 @@ EXPOSE 4001
 # The guard launches Blocky on loopback and owns the public listener.
 ENTRYPOINT ["/app/guard"]
 
+# Align the public guard with the MosDNS reference values.
+ENV GUARD_RATE=15 \
+    GUARD_BURST=40 \
+    GUARD_MAX_GLOBAL_CONNS=160 \
+    GUARD_MAX_IP_CONNS=24 \
+    GUARD_MAX_DNS_MESSAGE=4096 \
+    GUARD_IDLE_TIMEOUT=120s
+
 # Preserve a lightweight DNS-only healthcheck against Blocky's loopback resolver.
 HEALTHCHECK --start-period=1m --timeout=3s CMD ["/app/guard", "healthcheck"]
