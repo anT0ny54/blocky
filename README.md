@@ -1,75 +1,89 @@
 # Blocky for SnapDeploy
 
-A minimal public DNS-over-HTTPS (DoH) service built for small SnapDeploy instances, targeting **512 MB RAM / 0.25 vCPU**.
+A small public DNS-over-HTTPS (DoH) service built around Blocky and a lightweight Go gateway, tuned for a **512 MB RAM / 0.25 vCPU** SnapDeploy instance.
 
-## Runtime
+## Runtime layout
 
-- Container image: `spx01/blocky:v0.35.0`
-- Public HTTP listener: `4001`
-- DoH path: `/dns-query`
-- DNS listener: loopback-only `127.0.0.1:5300` for the container healthcheck; DNS is not publicly exposed and port `53` is not used
-- Outbound connections: IPv4 only
-- Upstreams: three HaGeZi full-protection DoH resolvers
-- Cache: bounded to 8192 entries
-- Prefetching: disabled to avoid unnecessary upstream traffic
-- Per-client rate limiting: enabled
-- Query logging: disabled
-- Prometheus metrics: disabled
-- Statistics collection: disabled
+The container runs two processes:
 
-The Go guard owns the public DoH listener on port `4001` and forwards only normalized DoH traffic to Blocky on loopback port `4002`. Keep the deployment's reverse proxy restricted to the intended DoH route and do not publish either loopback listener.
+```text
+Internet / SnapDeploy proxy
+          |
+          v
+   :4001  Go DoH guard
+          |
+          v
+   127.0.0.1:4002  Blocky HTTP/DoH
+          |
+          +--> 127.0.0.1:5300  Blocky DNS healthcheck only
+          |
+          +--> HaGeZi DoH upstreams (IPv4 egress)
+```
 
-## Moderate resource and anti-abuse defaults
+The runtime image is `spx01/blocky:v0.35.0`. Only port **4001** is public. Blocky's HTTP and DNS listeners are loopback-only and must not be published by the deployment.
 
-The public guard uses a per-client-IP + Host token bucket equivalent to **100 requests per 60 seconds**, with a **80-request startup burst**. This is applied before Blocky; Blocky's internal resolver-chain limiter stays disabled so clients do not encounter a second, host-agnostic quota on the loopback hop.
+The gateway accepts only `GET` and `POST` requests on `/dns-query`, validates the DNS wire message size and content type, applies connection/request limits, forwards to Blocky over loopback, and bounds the response body before returning it.
 
-| Setting | Default | Equivalent/reference |
+## Resource and abuse-protection defaults
+
+The public guard is the first layer before Blocky receives a query. Its rate bucket is keyed by the **client source IP**, so arbitrary `Host` headers cannot create independent buckets and bypass the intended per-client quota.
+
+| Setting | Default | Purpose |
 | :--- | ---: | :--- |
-| `GUARD_RATE` | `100/60s` (1.6667/s) | Per-client-IP + Host sustained rate |
-| `GUARD_BURST` | `80` | Browser-startup burst within the shared quota |
-| `GUARD_MAX_IP_CONNS` | `16` | Per-client-IP connection ceiling |
-| `GUARD_MAX_GLOBAL_CONNS` | `64` | Aggregate accept-time connection ceiling |
-| `GUARD_MAX_CONCURRENT_REQS` | `32` | Gateway concurrency ceiling for the 0.25 vCPU target |
-| `GUARD_MAX_IP_STATES` | `4096` | Fixed bounded state slots for IP + Host rate buckets |
-| `GUARD_MAX_QUERIES_PER_CONN` | `256` | Allows normal HTTP keep-alive/query reuse without a low artificial cap |
-| Blocky `rateLimit.enable` | `false` | Disabled to avoid a second host-agnostic quota on loopback |
-| Blocky `rateLimit.burst` | `1` | Inactive while Blocky's internal limiter is disabled |
-| `caching.maxItemsCount` | `8192` | Larger bounded cache for the 512 MB instance |
-| `GOMEMLIMIT` | `80MiB` | Public guard Go heap target; Blocky uses `BLOCKY_GOMEMLIMIT=288MiB` |
-| `BLOCKY_GOMEMLIMIT` | `288MiB` | Blocky child-process Go heap target |
+| `GUARD_RATE` | `100/60s` (1.6667/s) | Sustained requests per source IP |
+| `GUARD_BURST` | `80` | Initial burst capacity |
+| `GUARD_MAX_IP_CONNS` | `16` | Per-source concurrent connection ceiling |
+| `GUARD_MAX_GLOBAL_CONNS` | `64` | Aggregate connection ceiling |
+| `GUARD_MAX_CONCURRENT_REQS` | `32` | Gateway/backend concurrency ceiling |
+| `GUARD_MAX_IP_STATES` | `4096` | Bounded source-state slots |
+| `GUARD_MAX_QUERIES_PER_CONN` | `256` | Keep-alive/query reuse ceiling |
+| `GUARD_MAX_DNS_MESSAGE` | `4096` | Maximum DNS request wire size |
+| `GUARD_MAX_RESPONSE_BYTES` | `4096` | Maximum public DoH response body size |
+| `GUARD_IDLE_TIMEOUT` | `120s` | Public HTTP idle connection timeout |
+| `GOMEMLIMIT` | `80MiB` | Go heap target for the guard |
+| `BLOCKY_GOMEMLIMIT` | `288MiB` | Go heap target for Blocky |
+| `caching.maxItemsCount` | `8192` | Bounded DNS cache entries |
+| `caching.prefetching` | `false` | Avoid extra upstream traffic |
 
-The guard runs before Blocky and rejects excess connections/requests before DNS parsing or backend work. The DoH rate bucket is keyed by client IP + canonical Host, so multiple browsers/devices behind the same public IP share a host-specific 100/60-second budget. The 80-request burst is intended to absorb short browser-startup DNS bursts; it does not remove the 100/60-second sustained limit. `GOMEMLIMIT` is a soft per-process Go heap target rather than a hard container-memory cap.
+`GOMEMLIMIT` is a soft Go runtime heap target, not a hard container-memory cap. The combined 368 MiB heap targets leave headroom for stacks, native/runtime memory, buffers, the filesystem, and the container environment.
 
-## Free DNS Services
+Blocky's own resolver-chain rate limiter is disabled because the public guard already limits requests before the loopback hop. Keeping a second limiter there would apply a second quota to the gateway-to-Blocky connection instead of the original client.
 
-The following public DoH endpoints were listed with this project. Availability, filtering policy, hosting, and uptime are controlled by their respective operators/deployments.
+## Blocky configuration
 
-| Endpoint | Notes |
-| :--- | :--- |
-| `https://freedns.koyeb.app/dns-query` | Public DoH endpoint |
-| `https://dns-pi.vercel.app/api/doh/dns-query` | Public DoH endpoint |
-| `https://dnssix.netlify.app/api/doh/dns-query` | Public DoH endpoint |
-| `https://dns-93aca.containers.snapdeploy.app/dns-query` | SnapDeploy-hosted endpoint; may sleep when idle |
-| `https://doh-93aca.containers.snapdeploy.app/dns-query` | SnapDeploy-hosted endpoint; may sleep when idle |
+`config.yml` is the only Blocky configuration file. It uses Blocky's v0.35.0 schema modeline for editor validation.
 
-For the filtering backend used by this repository, the configured HaGeZi resolvers are:
+The default upstream set is the three HaGeZi **Full Protection** DoH endpoints:
 
 - `https://root.hagezi.org/dns-query`
 - `https://wurzn.hagezi.org/dns-query`
 - `https://juuri.hagezi.org/dns-query`
 
-See the [HaGeZi DNS server documentation](https://github.com/hagezi/dns-servers) for current resolver details.
+The three endpoints are configured with `random` upstream selection, IPv4-only outbound connections, and a 2-second upstream timeout. HaGeZi currently documents these hosts as Full Protection servers. See the [HaGeZi DNS server documentation](https://github.com/hagezi/dns-servers).
 
-## Configuration
+## Healthcheck
 
-The service uses `config.yml` as its single Blocky configuration file. The YAML schema comment at the top of the file enables editor validation against Blocky's configuration schema.
+Docker invokes `/app/guard healthcheck`. The helper sends a small DNS query to Blocky's loopback DNS listener at `127.0.0.1:5300` and verifies the response transaction ID and successful DNS response status.
 
-The configuration deliberately separates the public DoH listener from Blocky's internal HTTP listener and the DNS healthcheck listener: the guard serves public DoH on port `4001`, Blocky listens for HTTP only on `127.0.0.1:4002`, and DNS is available only on `127.0.0.1:5300`.
+This avoids making the public DoH listener itself the container healthcheck target.
+
+## Build
+
+The guard is built as a CGO-free, stripped static binary on the build platform and copied into the pinned Blocky runtime image. The build stage uses an exact Go patch release so the build toolchain does not drift underneath the project.
+
+```sh
+docker buildx build --platform linux/amd64 -t blocky-snapdeploy .
+```
+
+For ARM builds, BuildKit supplies the target architecture and variant and the guard is cross-compiled without target-architecture emulation during the build step.
+
+## Scope
+
+This repository is intentionally limited to the Blocky + DoH gateway deployment. Unrelated public DNS advertisements, proxy projects, donation information, and other service listings are not part of the runtime configuration.
 
 ## License
 
 See [`LICENSE`](LICENSE).
-
 
 ## 🌐 Free DNS Services
 

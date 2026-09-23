@@ -35,15 +35,8 @@ caching:
   prefetching: false
   cacheTimeNegative: 30m
 
-# Public DoH abuse protection is enforced by /app/guard using the client-IP +
-# Host token bucket. Keep Blocky's own resolver-chain limiter disabled so the
-# loopback hop cannot impose a second, host-agnostic quota.
-rateLimit:
-  enable: false
-  rate: 0
-  burst: 1
-  ipv4Prefix: 32
-  ipv6Prefix: 64
+# Public DoH abuse protection is enforced by /app/guard before Blocky.
+# Blocky keeps its optional resolver-chain limiter at the v0.35.0 default (off).
 
 log:
   level: info
