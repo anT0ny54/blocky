@@ -22,26 +22,29 @@ Internet / SnapDeploy proxy
 
 The runtime image is `spx01/blocky:v0.35.0`. Only port **4001** is public. Blocky's HTTP and DNS listeners are loopback-only and must not be published by the deployment.
 
-The gateway accepts only `GET` and `POST` requests on `/dns-query` (plus a static `200` for `GET /` so platform wake/readiness probes succeed), validates the DNS wire message size and content type, applies connection/request limits, forwards to Blocky over loopback, and bounds the response body before returning it.
+The gateway accepts only `GET` and `POST` requests on `/dns-query` (plus a static `200` for `GET /` so platform wake/readiness probes succeed), validates the DNS wire message size and content type, applies connection/request/rate limits, forwards to Blocky over loopback, validates successful DNS responses before returning them, and bounds the response body. Normal browser-side request cancellation is ignored rather than synthesized into an upstream failure.
 
 ## Resource and abuse-protection defaults
 
-The public guard is the first layer before Blocky receives a query. Rate buckets are keyed by the **real client address**, never by the `Host` header, so arbitrary `Host` values cannot create independent buckets.
+The public guard is the first layer before Blocky receives a query. The strict-DoH profile uses both a per-client token bucket and an aggregate global token bucket. Both are independent of the HTTP `Host` header, so changing `Host` cannot create another quota bucket.
 
 Behind the SnapDeploy proxy every user connects from the proxy's internal address. When `GUARD_CLIENT_IP_HEADER` is set, the guard reads the real client from that header **only if the TCP peer is a private, loopback, link-local or CGNAT address**. It walks the header from the right and takes the first public address, so entries injected by a client on the left are never used. Public peers cannot spoof it, and a missing or malformed header falls back to the peer address. IPv6 clients are tracked per `/64`.
 
 | Setting | Default | Purpose |
 | :--- | ---: | :--- |
-| `GUARD_RATE` | `10` | Sustained requests per second per client |
-| `GUARD_BURST` | `100` | Burst capacity per client |
+| `DOH_RATE_LIMIT` | `12` | Sustained requests per second per client |
+| `DOH_RATE_BURST` | `200` | Burst capacity per client |
+| `GLOBAL_RATE_LIMIT` | `80` | Aggregate sustained requests per second |
+| `GLOBAL_RATE_BURST` | `200` | Aggregate burst capacity |
 | `GUARD_CLIENT_IP_HEADER` | `X-Forwarded-For` (Dockerfile) | Forwarding header honoured for internal peers; empty disables |
-| `GUARD_MAX_IP_CONNS` | `16` | Per-source concurrent connections (not applied to the internal proxy peer) |
+| `IP_CONN_LIMIT` | `32` | Per-source concurrent connections (not applied to the internal proxy peer) |
 | `GUARD_MAX_GLOBAL_CONNS` | `512` | Aggregate connection ceiling |
 | `GUARD_MAX_CONCURRENT_REQS` | `64` | Gateway/backend concurrency ceiling |
 | `GUARD_MAX_IP_STATES` | `16384` | Bounded client-state slots |
 | `GUARD_MAX_QUERIES_PER_CONN` | `1024` | Keep-alive reuse ceiling; the last query is answered, then the connection closes |
 | `GUARD_MAX_DNS_MESSAGE` | `4096` (code) | Maximum DNS request wire size |
 | `GUARD_MAX_RESPONSE_BYTES` | `65535` (code) | Maximum public DoH response body size |
+| `SERVER_TIMEOUT` | `6` seconds | Guard-to-Blocky query deadline; accepts seconds or Go duration syntax |
 | `GUARD_IDLE_TIMEOUT` | `60s` | Public HTTP idle connection timeout |
 | `GOMAXPROCS` | `1` | Matches the 0.25 vCPU allocation |
 | `GOMEMLIMIT` | `48MiB` | Go heap target for the guard |
@@ -49,7 +52,9 @@ Behind the SnapDeploy proxy every user connects from the proxy's internal addres
 | `caching.maxItemsCount` | `20000` | Bounded DNS cache entries |
 | `caching.prefetching` | `false` | Avoid extra upstream traffic |
 
-Refused requests are handled differently by peer type. A direct client is disconnected without a response. The internal proxy shares connections between many users, so it receives a real status code (`429` with `Retry-After`, `400`, `404` or `502`) and keeps the connection.
+For compatibility with older deployments, `GUARD_RATE`, `GUARD_BURST`, `GUARD_MAX_IP_CONNS`, and `GUARD_BACKEND_TIMEOUT` remain accepted as fallback environment names; the strict-DoH names above take precedence.
+
+Refused requests are handled differently by peer type. A direct client is disconnected without a response for policy/rate/validation rejections. Backend failures (`502 Bad Gateway`) are explicit for both direct and proxied clients, so strict DoH clients can retry or report the lookup failure. The internal proxy receives normal status codes (`429` with `Retry-After`, `400`, `404`, or `502`) and keeps the connection.
 
 `GOMEMLIMIT` is a soft Go runtime heap target, not a hard container-memory cap. The combined 368 MiB heap targets leave headroom for stacks, native/runtime memory, buffers, the filesystem, and the container environment.
 
@@ -67,7 +72,7 @@ The default upstream set is the three HaGeZi **Full Protection** DoH endpoints:
 - `https://wurzn.hagezi.org/dns-query`
 - `https://juuri.hagezi.org/dns-query`
 
-The three endpoints are configured with `random` upstream selection, IPv4-only outbound connections, and a 2-second upstream timeout. HaGeZi currently documents these hosts as Full Protection servers. See the [HaGeZi DNS server documentation](https://github.com/hagezi/dns-servers).
+The three endpoints are configured with `random` upstream selection, IPv4-only outbound connections, and a 2-second Blocky upstream timeout. The guard's `SERVER_TIMEOUT=6` is the outer gateway-to-Blocky query deadline. This repository uses Blocky rather than MosDNS, so there is no MosDNS sequential-failover deadline or persisted MosDNS probe-state file in this archive.
 
 ## Healthcheck
 

@@ -23,16 +23,22 @@ COPY --from=guard-build /guard /app/guard
 # Tuned for SnapDeploy's 512 MB RAM / 0.25 vCPU instance. The two heap targets
 # (48 + 320 MiB) are soft limits that leave ~140 MiB of the 512 MB for stacks,
 # native memory, buffers and the container itself.
-#   GUARD_RATE / GUARD_BURST   per-client sustained req/s and burst (real client
-#                              taken from GUARD_CLIENT_IP_HEADER behind the proxy)
-#   GUARD_CLIENT_IP_HEADER     forwarding header honoured only when the TCP peer
-#                              is a private/loopback/CGNAT address (the platform
-#                              proxy); public peers can never spoof it
-ENV GUARD_RATE=10 \
-    GUARD_BURST=100 \
+#   DOH_RATE_LIMIT / DOH_RATE_BURST       per-client sustained req/s and burst
+#   GLOBAL_RATE_LIMIT / GLOBAL_RATE_BURST aggregate sustained req/s and burst
+#   IP_CONN_LIMIT                          per-public-source connection cap
+#   SERVER_TIMEOUT                         backend query deadline
+#   GUARD_CLIENT_IP_HEADER                 forwarding header honoured only when
+#                                         the TCP peer is private/loopback/CGNAT
+#                                         (the platform proxy); public peers
+#                                         can never spoof it
+ENV DOH_RATE_LIMIT=12 \
+    DOH_RATE_BURST=200 \
+    GLOBAL_RATE_LIMIT=80 \
+    GLOBAL_RATE_BURST=200 \
+    IP_CONN_LIMIT=32 \
+    SERVER_TIMEOUT=6 \
     GUARD_CLIENT_IP_HEADER=X-Forwarded-For \
     GUARD_MAX_GLOBAL_CONNS=512 \
-    GUARD_MAX_IP_CONNS=16 \
     GUARD_MAX_IP_STATES=16384 \
     GUARD_MAX_CONCURRENT_REQS=64 \
     GUARD_MAX_QUERIES_PER_CONN=1024 \
