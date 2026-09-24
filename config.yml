@@ -28,9 +28,9 @@ connectIPVersion: v4
 caching:
   minTime: 5m
   maxTime: 1h
-  # Larger bounded cache uses available RAM for more cache hits without
-  # making cache growth attacker-controlled.
-  maxItemsCount: 8192
+  # Bounded cache: ~20k entries is a few tens of MB, well inside Blocky's
+  # 320 MiB heap target, and cannot grow with attacker-controlled input.
+  maxItemsCount: 20000
   # Prefetching improves latency but causes extra upstream traffic and memory use.
   prefetching: false
   cacheTimeNegative: 30m

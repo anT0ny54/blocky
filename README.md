@@ -22,32 +22,40 @@ Internet / SnapDeploy proxy
 
 The runtime image is `spx01/blocky:v0.35.0`. Only port **4001** is public. Blocky's HTTP and DNS listeners are loopback-only and must not be published by the deployment.
 
-The gateway accepts only `GET` and `POST` requests on `/dns-query`, validates the DNS wire message size and content type, applies connection/request limits, forwards to Blocky over loopback, and bounds the response body before returning it.
+The gateway accepts only `GET` and `POST` requests on `/dns-query` (plus a static `200` for `GET /` so platform wake/readiness probes succeed), validates the DNS wire message size and content type, applies connection/request limits, forwards to Blocky over loopback, and bounds the response body before returning it.
 
 ## Resource and abuse-protection defaults
 
-The public guard is the first layer before Blocky receives a query. Its rate bucket is keyed by the **client source IP**, so arbitrary `Host` headers cannot create independent buckets and bypass the intended per-client quota.
+The public guard is the first layer before Blocky receives a query. Rate buckets are keyed by the **real client address**, never by the `Host` header, so arbitrary `Host` values cannot create independent buckets.
+
+Behind the SnapDeploy proxy every user connects from the proxy's internal address. When `GUARD_CLIENT_IP_HEADER` is set, the guard reads the real client from that header **only if the TCP peer is a private, loopback, link-local or CGNAT address**. It walks the header from the right and takes the first public address, so entries injected by a client on the left are never used. Public peers cannot spoof it, and a missing or malformed header falls back to the peer address. IPv6 clients are tracked per `/64`.
 
 | Setting | Default | Purpose |
 | :--- | ---: | :--- |
-| `GUARD_RATE` | `100/60s` (1.6667/s) | Sustained requests per source IP |
-| `GUARD_BURST` | `80` | Initial burst capacity |
-| `GUARD_MAX_IP_CONNS` | `16` | Per-source concurrent connection ceiling |
-| `GUARD_MAX_GLOBAL_CONNS` | `64` | Aggregate connection ceiling |
-| `GUARD_MAX_CONCURRENT_REQS` | `32` | Gateway/backend concurrency ceiling |
-| `GUARD_MAX_IP_STATES` | `4096` | Bounded source-state slots |
-| `GUARD_MAX_QUERIES_PER_CONN` | `256` | Keep-alive/query reuse ceiling |
-| `GUARD_MAX_DNS_MESSAGE` | `4096` | Maximum DNS request wire size |
-| `GUARD_MAX_RESPONSE_BYTES` | `4096` | Maximum public DoH response body size |
-| `GUARD_IDLE_TIMEOUT` | `120s` | Public HTTP idle connection timeout |
-| `GOMEMLIMIT` | `80MiB` | Go heap target for the guard |
-| `BLOCKY_GOMEMLIMIT` | `288MiB` | Go heap target for Blocky |
-| `caching.maxItemsCount` | `8192` | Bounded DNS cache entries |
+| `GUARD_RATE` | `10` | Sustained requests per second per client |
+| `GUARD_BURST` | `100` | Burst capacity per client |
+| `GUARD_CLIENT_IP_HEADER` | `X-Forwarded-For` (Dockerfile) | Forwarding header honoured for internal peers; empty disables |
+| `GUARD_MAX_IP_CONNS` | `16` | Per-source concurrent connections (not applied to the internal proxy peer) |
+| `GUARD_MAX_GLOBAL_CONNS` | `512` | Aggregate connection ceiling |
+| `GUARD_MAX_CONCURRENT_REQS` | `64` | Gateway/backend concurrency ceiling |
+| `GUARD_MAX_IP_STATES` | `16384` | Bounded client-state slots |
+| `GUARD_MAX_QUERIES_PER_CONN` | `1024` | Keep-alive reuse ceiling; the last query is answered, then the connection closes |
+| `GUARD_MAX_DNS_MESSAGE` | `4096` (code) | Maximum DNS request wire size |
+| `GUARD_MAX_RESPONSE_BYTES` | `65535` (code) | Maximum public DoH response body size |
+| `GUARD_IDLE_TIMEOUT` | `60s` | Public HTTP idle connection timeout |
+| `GOMAXPROCS` | `1` | Matches the 0.25 vCPU allocation |
+| `GOMEMLIMIT` | `48MiB` | Go heap target for the guard |
+| `BLOCKY_GOMEMLIMIT` | `320MiB` | Go heap target for Blocky |
+| `caching.maxItemsCount` | `20000` | Bounded DNS cache entries |
 | `caching.prefetching` | `false` | Avoid extra upstream traffic |
+
+Refused requests are handled differently by peer type. A direct client is disconnected without a response. The internal proxy shares connections between many users, so it receives a real status code (`429` with `Retry-After`, `400`, `404` or `502`) and keeps the connection.
 
 `GOMEMLIMIT` is a soft Go runtime heap target, not a hard container-memory cap. The combined 368 MiB heap targets leave headroom for stacks, native/runtime memory, buffers, the filesystem, and the container environment.
 
 Blocky's own resolver-chain rate limiter is disabled because the public guard already limits requests before the loopback hop. Keeping a second limiter there would apply a second quota to the gateway-to-Blocky connection instead of the original client.
+
+If Blocky or the guard exits, the container exits non-zero so the platform restarts it.
 
 ## Blocky configuration
 
@@ -79,25 +87,19 @@ For ARM builds, BuildKit supplies the target architecture and variant and the gu
 
 ## Scope
 
-This repository is intentionally limited to the Blocky + DoH gateway deployment. Unrelated public DNS advertisements, proxy projects, donation information, and other service listings are not part of the runtime configuration.
+This repository is limited to the Blocky + DoH gateway deployment. The list below is informational and is not part of the runtime configuration.
 
-## License
+## Public endpoints
 
-See [`LICENSE`](LICENSE).
-
-## 🌐 Free DNS Services
-
-High-performance DNS utilizing HaGeZi Blocklists (Multi Pro + TIF).
+High-performance DNS using HaGeZi Multi Pro + TIF blocklists.
 
 | Blocklist | DNS-over-HTTPS (DoH) |
 | :--- | :--- |
 | Multi Pro + TIF | `https://freedns.koyeb.app/dns-query` (Recommended) |
 | Multi Pro + TIF | `https://dns-pi.vercel.app/api/doh/dns-query` (Recommended) |
 | Multi Pro + TIF | `https://dnssix.netlify.app/api/doh/dns-query` |
-| Multi Pro + TIF | `https://dns-93aca.containers.snapdeploy.app/dns-query` (Recommended, but will sleep if not use in 15 minute) |
-| Multi Pro + TIF | `https://doh-93aca.containers.snapdeploy.app/dns-query` (Recommended, but will sleep if not use in 15 minute) |
-
----
+| Multi Pro + TIF | `https://dns-93aca.containers.snapdeploy.app/dns-query` (Recommended; sleeps after 15 minutes idle) |
+| Multi Pro + TIF | `https://doh-93aca.containers.snapdeploy.app/dns-query` (Recommended; sleeps after 15 minutes idle) |
 
 # ⚡ Bandwidth Hero Server
 
@@ -107,7 +109,6 @@ Bandwidth Hero Server fetches remote images, compresses them on the fly, and del
 
 🖥️ **Live Demo:** [Bandwidth Hero](https://bhserv.netlify.app/).
 
-## Supporting the Project
+## License
 
-If you find this project useful, donations are appreciated:
-- **Bitcoin**: `1HntwKxyqGCfnSGvGLMUTRAqLnTvLarAQP`
+See [`LICENSE`](LICENSE).
