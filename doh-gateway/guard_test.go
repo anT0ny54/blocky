@@ -7,17 +7,30 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 )
 
+// stateCount is a test-only view of the total tracked source states.
+func (t *sourceTable) stateCount() int {
+	n := 0
+	for i := 0; i < t.shardCount; i++ {
+		s := &t.shards[i]
+		s.mu.Lock()
+		n += len(s.clients)
+		s.mu.Unlock()
+	}
+	return n
+}
+
 func TestSourceTableIsBounded(t *testing.T) {
 	table := newSourceTable(128)
 	now := time.Now()
 	for i := 0; i < 1000; i++ {
-		key := "192.0.2." + strconvItoa(i%250)
+		key := "192.0.2." + strconv.Itoa(i%250)
 		_ = table.allow(key, now.Add(time.Duration(i)*time.Millisecond), 10, 20)
 	}
 	if got := table.stateCount(); got > 128 {
@@ -30,26 +43,27 @@ func TestDefaultGuardRateAndBurst(t *testing.T) {
 	if cfg.Rate != defaultRate {
 		t.Fatalf("default rate = %v, want %v", cfg.Rate, defaultRate)
 	}
-	if cfg.Burst != 80 {
-		t.Fatalf("default burst = %v, want 80", cfg.Burst)
+	if cfg.Burst != defaultBurst {
+		t.Fatalf("default burst = %v, want %v", cfg.Burst, defaultBurst)
 	}
 	if cfg.Burst < cfg.Rate {
 		t.Fatalf("default burst = %v is below default rate = %v", cfg.Burst, cfg.Rate)
 	}
 }
 
-func TestDefaultBurstAllows80ImmediateRequests(t *testing.T) {
+func TestDefaultBurstAllowsBurstImmediateRequests(t *testing.T) {
 	cfg := defaultGuardConfig()
 	table := newSourceTable(64)
 	now := time.Unix(1000, 0)
 	key := "198.51.100.30"
-	for i := 0; i < 80; i++ {
+	burst := int(cfg.Burst)
+	for i := 0; i < burst; i++ {
 		if !table.allow(key, now, cfg.Rate, cfg.Burst) {
-			t.Fatalf("request %d of 80 was rejected", i+1)
+			t.Fatalf("request %d of %d was rejected", i+1, burst)
 		}
 	}
 	if table.allow(key, now, cfg.Rate, cfg.Burst) {
-		t.Fatal("81st immediate request was accepted; burst should be 80")
+		t.Fatalf("request %d was accepted immediately; burst should be %d", burst+1, burst)
 	}
 }
 
@@ -91,25 +105,24 @@ func TestPerIPConnectionLimit(t *testing.T) {
 	table := newSourceTable(64)
 	now := time.Now()
 	key := "203.0.113.9"
-	if _, ok := table.admitConn(key, 2, now, 10, 20); !ok {
+	if !table.admitConn(key, 2, now, 20) {
 		t.Fatal("first connection rejected")
 	}
-	if _, ok := table.admitConn(key, 2, now, 10, 20); !ok {
+	if !table.admitConn(key, 2, now, 20) {
 		t.Fatal("second connection rejected")
 	}
-	if _, ok := table.admitConn(key, 2, now, 10, 20); ok {
+	if table.admitConn(key, 2, now, 20) {
 		t.Fatal("third connection should be rejected")
 	}
 	table.releaseConn(key)
-	if _, ok := table.admitConn(key, 2, now, 10, 20); !ok {
+	if !table.admitConn(key, 2, now, 20) {
 		t.Fatal("connection should be admitted after release")
 	}
 }
 
 func TestSourceKeyCanonicalizesIPv4MappedIPv6(t *testing.T) {
-	got, ok := sourceKey(&net.TCPAddr{IP: net.ParseIP("::ffff:192.0.2.44"), Port: 1234})
-	if !ok || got != "192.0.2.44" {
-		t.Fatalf("unexpected source key: %q %v", got, ok)
+	if got := canonicalIPKey(net.ParseIP("::ffff:192.0.2.44")); got != "192.0.2.44" {
+		t.Fatalf("unexpected source key: %q", got)
 	}
 }
 
@@ -117,7 +130,7 @@ func TestTrackedConnCloseReleasesCounters(t *testing.T) {
 	g := NewGuard(defaultGuardConfig())
 	server, client := net.Pipe()
 	defer client.Close()
-	_, ok := g.states.admitConn("192.0.2.55", g.cfg.MaxPerIPConns, time.Now(), g.cfg.Rate, g.cfg.Burst)
+	ok := g.states.admitConn("192.0.2.55", g.cfg.MaxPerIPConns, time.Now(), g.cfg.Burst)
 	if !ok {
 		t.Fatal("connection admission failed")
 	}
@@ -132,20 +145,6 @@ func TestTrackedConnCloseReleasesCounters(t *testing.T) {
 	if got := g.globalCon.Load(); got != 0 {
 		t.Fatalf("global count after close = %d", got)
 	}
-}
-
-func strconvItoa(i int) string {
-	if i == 0 {
-		return "0"
-	}
-	buf := [20]byte{}
-	p := len(buf)
-	for i > 0 {
-		p--
-		buf[p] = byte('0' + i%10)
-		i /= 10
-	}
-	return string(buf[p:])
 }
 
 func TestReadDoHBodyEnforcesWireSizeBeforeForwarding(t *testing.T) {
@@ -225,7 +224,7 @@ func TestDoHProxySanitizesForwardedClientIP(t *testing.T) {
 	cfg := defaultGuardConfig()
 	cfg.BackendHTTP = strings.TrimPrefix(backend.URL, "http://")
 	g := NewGuard(cfg)
-	_, ok := g.states.admitConn("192.0.2.77", cfg.MaxPerIPConns, time.Now(), cfg.Rate, cfg.Burst)
+	ok := g.states.admitConn("192.0.2.77", cfg.MaxPerIPConns, time.Now(), cfg.Burst)
 	if !ok {
 		t.Fatal("client state admission failed")
 	}
@@ -338,7 +337,7 @@ func TestDoHRateLimitCannotBeFragmentedByHost(t *testing.T) {
 	cfg.Burst = 1
 	cfg.BackendHTTP = strings.TrimPrefix(backend.URL, "http://")
 	g := NewGuard(cfg)
-	_, ok := g.states.admitConn("192.0.2.76", cfg.MaxPerIPConns, time.Now(), cfg.Rate, cfg.Burst)
+	ok := g.states.admitConn("192.0.2.76", cfg.MaxPerIPConns, time.Now(), cfg.Burst)
 	if !ok {
 		t.Fatal("client state admission failed")
 	}
@@ -393,7 +392,7 @@ func TestDoHProxyNormalizesGETQueryAndBackendHost(t *testing.T) {
 	cfg := defaultGuardConfig()
 	cfg.BackendHTTP = strings.TrimPrefix(backend.URL, "http://")
 	g := NewGuard(cfg)
-	_, ok := g.states.admitConn("192.0.2.77", cfg.MaxPerIPConns, time.Now(), cfg.Rate, cfg.Burst)
+	ok := g.states.admitConn("192.0.2.77", cfg.MaxPerIPConns, time.Now(), cfg.Burst)
 	if !ok {
 		t.Fatal("client state admission failed")
 	}
@@ -435,7 +434,7 @@ func TestDoHProxyDoesNotFollowBackendRedirects(t *testing.T) {
 	cfg := defaultGuardConfig()
 	cfg.BackendHTTP = strings.TrimPrefix(backend.URL, "http://")
 	g := NewGuard(cfg)
-	_, ok := g.states.admitConn("192.0.2.78", cfg.MaxPerIPConns, time.Now(), cfg.Rate, cfg.Burst)
+	ok := g.states.admitConn("192.0.2.78", cfg.MaxPerIPConns, time.Now(), cfg.Burst)
 	if !ok {
 		t.Fatal("client state admission failed")
 	}
@@ -474,7 +473,7 @@ func TestDoHProxyRejectsOversizedBackendResponseHeaders(t *testing.T) {
 	cfg.MaxHeaderBytes = 16 << 10
 	cfg.BackendHTTP = strings.TrimPrefix(backend.URL, "http://")
 	g := NewGuard(cfg)
-	_, ok := g.states.admitConn("192.0.2.79", cfg.MaxPerIPConns, time.Now(), cfg.Rate, cfg.Burst)
+	ok := g.states.admitConn("192.0.2.79", cfg.MaxPerIPConns, time.Now(), cfg.Burst)
 	if !ok {
 		t.Fatal("client state admission failed")
 	}
@@ -510,7 +509,7 @@ func TestDoHProxyRejectsUnknownLengthOversizedBackendResponse(t *testing.T) {
 	cfg.MaxResponseBytes = 512
 	cfg.BackendHTTP = strings.TrimPrefix(backend.URL, "http://")
 	g := NewGuard(cfg)
-	_, ok := g.states.admitConn("192.0.2.82", cfg.MaxPerIPConns, time.Now(), cfg.Rate, cfg.Burst)
+	ok := g.states.admitConn("192.0.2.82", cfg.MaxPerIPConns, time.Now(), cfg.Burst)
 	if !ok {
 		t.Fatal("client state admission failed")
 	}
@@ -595,7 +594,7 @@ func TestDoHProxyDoesNotForwardStandardHopByHopHeaders(t *testing.T) {
 	cfg := defaultGuardConfig()
 	cfg.BackendHTTP = strings.TrimPrefix(backend.URL, "http://")
 	g := NewGuard(cfg)
-	_, ok := g.states.admitConn("192.0.2.81", cfg.MaxPerIPConns, time.Now(), cfg.Rate, cfg.Burst)
+	ok := g.states.admitConn("192.0.2.81", cfg.MaxPerIPConns, time.Now(), cfg.Burst)
 	if !ok {
 		t.Fatal("client state admission failed")
 	}
@@ -649,7 +648,7 @@ func TestDoHProxyDoesNotForwardConnectionNominatedHeaders(t *testing.T) {
 	cfg := defaultGuardConfig()
 	cfg.BackendHTTP = strings.TrimPrefix(backend.URL, "http://")
 	g := NewGuard(cfg)
-	_, ok := g.states.admitConn("192.0.2.80", cfg.MaxPerIPConns, time.Now(), cfg.Rate, cfg.Burst)
+	ok := g.states.admitConn("192.0.2.80", cfg.MaxPerIPConns, time.Now(), cfg.Burst)
 	if !ok {
 		t.Fatal("client state admission failed")
 	}
@@ -679,5 +678,137 @@ func TestDoHProxyDoesNotForwardConnectionNominatedHeaders(t *testing.T) {
 	}
 	if got := w.Header().Get("Connection"); got != "" {
 		t.Fatalf("Connection response header leaked: %q", got)
+	}
+}
+
+func TestSourceKeyGroupsIPv6ByPrefix(t *testing.T) {
+	a := canonicalIPKey(net.ParseIP("2001:db8:1:2:aaaa::1"))
+	b := canonicalIPKey(net.ParseIP("2001:db8:1:2:bbbb::2"))
+	c := canonicalIPKey(net.ParseIP("2001:db8:1:3::1"))
+	if a != b {
+		t.Fatalf("addresses in one /64 got different keys: %q vs %q", a, b)
+	}
+	if a == c {
+		t.Fatalf("addresses in different /64s share a key: %q", a)
+	}
+}
+
+func TestIsInternalIP(t *testing.T) {
+	for ip, want := range map[string]bool{
+		"127.0.0.1":    true,
+		"10.1.2.3":     true,
+		"172.16.0.9":   true,
+		"192.168.1.1":  true,
+		"100.64.0.1":   true,
+		"169.254.1.1":  true,
+		"fd00::1":      true,
+		"::1":          true,
+		"8.8.8.8":      false,
+		"100.128.0.1":  false,
+		"2001:db8::1":  false,
+		"203.0.113.10": false,
+	} {
+		if got := isInternalIP(net.ParseIP(ip)); got != want {
+			t.Errorf("isInternalIP(%s) = %v, want %v", ip, got, want)
+		}
+	}
+}
+
+func TestClientIPFromHeaderIgnoresClientInjectedValues(t *testing.T) {
+	h := make(http.Header)
+	h.Set("X-Forwarded-For", "198.51.100.99, 203.0.113.5, 10.0.0.2")
+	ip, ok := clientIPFromHeader(h, "X-Forwarded-For")
+	if !ok || ip.String() != "203.0.113.5" {
+		t.Fatalf("got %v %v, want the right-most public hop 203.0.113.5", ip, ok)
+	}
+
+	h.Set("X-Forwarded-For", "203.0.113.5, not-an-ip")
+	if _, ok := clientIPFromHeader(h, "X-Forwarded-For"); ok {
+		t.Fatal("malformed header was trusted")
+	}
+
+	h.Set("X-Forwarded-For", "10.0.0.7, 192.168.0.1")
+	if _, ok := clientIPFromHeader(h, "X-Forwarded-For"); ok {
+		t.Fatal("all-internal header should fall back to the peer")
+	}
+
+	if _, ok := clientIPFromHeader(make(http.Header), "X-Forwarded-For"); ok {
+		t.Fatal("missing header was trusted")
+	}
+}
+
+func TestTrustedProxyRateLimitsByForwardedClient(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("X-Forwarded-For"); got != "203.0.113.50" && got != "203.0.113.51" {
+			t.Errorf("backend saw client %q", got)
+		}
+		w.Header().Set("Content-Type", "application/dns-message")
+		_, _ = w.Write([]byte{0x01, 0x02})
+	}))
+	defer backend.Close()
+
+	cfg := defaultGuardConfig()
+	cfg.Rate = 1
+	cfg.Burst = 1
+	cfg.ClientIPHeader = "X-Forwarded-For"
+	cfg.BackendHTTP = strings.TrimPrefix(backend.URL, "http://")
+	g := NewGuard(cfg)
+	conn := &trackedConn{source: "10.0.0.2", guard: g, trusted: true}
+
+	serve := func(client string) int {
+		req, err := http.NewRequest(http.MethodGet, "http://guard/dns-query?dns=AAE", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("X-Forwarded-For", client)
+		req = req.WithContext(context.WithValue(req.Context(), connStateKey{}, conn))
+		w := httptest.NewRecorder()
+		g.Handler().ServeHTTP(w, req)
+		return w.Code
+	}
+
+	if got := serve("203.0.113.50"); got != http.StatusOK {
+		t.Fatalf("first client status: %d", got)
+	}
+	if got := serve("203.0.113.50"); got != http.StatusTooManyRequests {
+		t.Fatalf("same client over its limit got status %d", got)
+	}
+	if got := serve("203.0.113.51"); got != http.StatusOK {
+		t.Fatalf("a different client behind the same proxy was throttled: %d", got)
+	}
+}
+
+func TestLastQueryClosesConnectionGracefully(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/dns-message")
+		_, _ = w.Write([]byte{0x01, 0x02})
+	}))
+	defer backend.Close()
+
+	cfg := defaultGuardConfig()
+	cfg.MaxQueriesPerConn = 2
+	cfg.BackendHTTP = strings.TrimPrefix(backend.URL, "http://")
+	g := NewGuard(cfg)
+	conn := &trackedConn{source: "192.0.2.90", guard: g}
+
+	serve := func() *httptest.ResponseRecorder {
+		req, err := http.NewRequest(http.MethodGet, "http://guard/dns-query?dns=AAE", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req = req.WithContext(context.WithValue(req.Context(), connStateKey{}, conn))
+		w := httptest.NewRecorder()
+		g.Handler().ServeHTTP(w, req)
+		return w
+	}
+
+	if w := serve(); w.Code != http.StatusOK || w.Header().Get("Connection") != "" {
+		t.Fatalf("first query: status=%d connection=%q", w.Code, w.Header().Get("Connection"))
+	}
+	if w := serve(); w.Code != http.StatusOK || w.Header().Get("Connection") != "close" {
+		t.Fatalf("final query: status=%d connection=%q", w.Code, w.Header().Get("Connection"))
+	}
+	if w := serve(); w.Code != http.StatusTooManyRequests {
+		t.Fatalf("query over the cap: status=%d", w.Code)
 	}
 }

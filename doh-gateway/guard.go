@@ -27,24 +27,29 @@ const (
 	defaultListenAddr       = ":4001"
 	defaultBackendHTTP      = "127.0.0.1:4002"
 	defaultDohPath          = "/dns-query"
-	defaultRate             = 100.0 / 60.0 // 100 requests per 60 seconds sustained
-	defaultBurst            = 80.0
-	defaultGlobalConns      = 64
+	defaultRate             = 10.0 // sustained requests per second per client
+	defaultBurst            = 100.0
+	defaultGlobalConns      = 512
 	defaultPerIPConns       = 16
-	defaultMaxSourceStates  = 4096
+	defaultMaxSourceStates  = 16384
 	defaultMaxDNSMessage    = 4096
-	defaultMaxQueriesConn   = 256
+	defaultMaxQueriesConn   = 1024
 	defaultMaxHeaderBytes   = 16 << 10
 	defaultResponseMaxBytes = 65535
 	defaultStateIdle        = 2 * time.Minute
 	defaultReadHeader       = 5 * time.Second
 	defaultReadTimeout      = 10 * time.Second
 	defaultWriteTimeout     = 10 * time.Second
-	defaultIdleTimeout      = 20 * time.Second
+	defaultIdleTimeout      = 60 * time.Second
 	defaultBackendTimeout   = 5 * time.Second
-	defaultMaxRequests      = 32
+	defaultMaxRequests      = 64
+	defaultBlockyMemLimit   = "320MiB"
 
 	stateShards = 64
+
+	// maxInt32 caps the per-source connection limit applied to platform-internal
+	// peers, which are bounded by the global connection cap instead.
+	maxInt32 = 1<<31 - 1
 )
 
 // GuardConfig intentionally stays independent from Blocky's resolver-chain rate
@@ -54,6 +59,7 @@ type GuardConfig struct {
 	ListenAddr        string
 	BackendHTTP       string
 	DOHPath           string
+	ClientIPHeader    string
 	Rate              float64
 	Burst             float64
 	MaxGlobalConns    int64
@@ -101,6 +107,7 @@ func loadGuardConfig() GuardConfig {
 	c.ListenAddr = envString("GUARD_LISTEN", c.ListenAddr)
 	c.BackendHTTP = envString("GUARD_BACKEND", c.BackendHTTP)
 	c.DOHPath = envString("GUARD_DOH_PATH", c.DOHPath)
+	c.ClientIPHeader = http.CanonicalHeaderKey(envString("GUARD_CLIENT_IP_HEADER", c.ClientIPHeader))
 	c.Rate = envFloat("GUARD_RATE", c.Rate)
 	c.Burst = envFloat("GUARD_BURST", c.Burst)
 	c.MaxGlobalConns = envInt64("GUARD_MAX_GLOBAL_CONNS", c.MaxGlobalConns)
@@ -353,7 +360,7 @@ func (t *sourceTable) allowLocked(s *stateShard, shardIdx int, key string, now t
 	return true
 }
 
-func (t *sourceTable) admitConn(key string, max int32, now time.Time, rate, burst float64) (*clientState, bool) {
+func (t *sourceTable) admitConn(key string, max int32, now time.Time, burst float64) bool {
 	shardIdx := t.sourceHash(key) % uint64(t.shardCount)
 	s := &t.shards[shardIdx]
 	s.mu.Lock()
@@ -362,15 +369,15 @@ func (t *sourceTable) admitConn(key string, max int32, now time.Time, rate, burs
 	if st == nil {
 		st = t.createLocked(int(shardIdx), key, now, burst)
 		if st == nil {
-			return nil, false
+			return false
 		}
 	}
 	st.lastSeen = now
 	if st.conns >= max {
-		return st, false
+		return false
 	}
 	st.conns++
-	return st, true
+	return true
 }
 
 func (t *sourceTable) releaseConn(key string) {
@@ -380,17 +387,6 @@ func (t *sourceTable) releaseConn(key string) {
 	if st := s.clients[key]; st != nil && st.conns > 0 {
 		st.conns--
 	}
-}
-
-func (t *sourceTable) stateCount() int {
-	n := 0
-	for i := 0; i < t.shardCount; i++ {
-		s := &t.shards[i]
-		s.mu.Lock()
-		n += len(s.clients)
-		s.mu.Unlock()
-	}
-	return n
 }
 
 type Guard struct {
@@ -404,10 +400,13 @@ type Guard struct {
 func NewGuard(cfg GuardConfig) *Guard {
 	cfg.normalize()
 	tr := &http.Transport{
-		Proxy:                  nil,
+		Proxy: nil,
+		DialContext: (&net.Dialer{
+			Timeout: 2 * time.Second,
+		}).DialContext,
 		MaxConnsPerHost:        int(cfg.MaxConcurrentReqs),
 		MaxIdleConns:           16,
-		MaxIdleConnsPerHost:    8,
+		MaxIdleConnsPerHost:    16,
 		IdleConnTimeout:        20 * time.Second,
 		ResponseHeaderTimeout:  cfg.BackendTimeout,
 		MaxResponseHeaderBytes: int64(cfg.MaxHeaderBytes),
@@ -460,22 +459,76 @@ func (g *Guard) releaseGlobal() {
 	g.globalCon.Add(-1)
 }
 
-func sourceKey(addr net.Addr) (string, bool) {
+// canonicalIPKey returns the rate-limit identity for an address: IPv4 (and
+// IPv4-mapped IPv6) addresses individually, IPv6 addresses by their /64 so a
+// single subscriber cannot mint unlimited identities from one delegated prefix.
+func canonicalIPKey(ip net.IP) string {
+	if v4 := ip.To4(); v4 != nil {
+		return v4.String()
+	}
+	return ip.Mask(net.CIDRMask(64, 128)).String()
+}
+
+func sourceIP(addr net.Addr) (net.IP, bool) {
 	a, ok := addr.(*net.TCPAddr)
 	if !ok || a.IP == nil {
-		return "", false
+		return nil, false
 	}
-	ip := a.IP
+	return a.IP, true
+}
+
+var cgnatPrefix = net.IPNet{IP: net.IPv4(100, 64, 0, 0), Mask: net.CIDRMask(10, 32)}
+
+// isInternalIP reports whether ip is loopback, private, link-local or CGNAT
+// space, i.e. an address that cannot be a directly connected Internet client.
+func isInternalIP(ip net.IP) bool {
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsUnspecified() {
+		return true
+	}
 	if v4 := ip.To4(); v4 != nil {
-		ip = v4
+		return cgnatPrefix.Contains(v4)
 	}
-	return ip.String(), true
+	return false
+}
+
+func parseHeaderIP(token string) net.IP {
+	token = strings.TrimSpace(token)
+	if ip := net.ParseIP(token); ip != nil {
+		return ip
+	}
+	if host, _, err := net.SplitHostPort(token); err == nil {
+		return net.ParseIP(host)
+	}
+	return nil
+}
+
+// clientIPFromHeader extracts the real client from a forwarding header set by
+// the platform proxy. It walks the list from the right (the entries appended by
+// our own trusted hops) and returns the first non-internal address, so values
+// injected by the client on the left can never be selected. Malformed input is
+// rejected so the caller falls back to the connection peer.
+func clientIPFromHeader(h http.Header, name string) (net.IP, bool) {
+	values := h.Values(name)
+	for i := len(values) - 1; i >= 0; i-- {
+		tokens := strings.Split(values[i], ",")
+		for j := len(tokens) - 1; j >= 0; j-- {
+			ip := parseHeaderIP(tokens[j])
+			if ip == nil {
+				return nil, false
+			}
+			if !isInternalIP(ip) {
+				return ip, true
+			}
+		}
+	}
+	return nil, false
 }
 
 type trackedConn struct {
 	net.Conn
 	guard    *Guard
 	source   string
+	trusted  bool // peer is a platform-internal proxy whose forwarding header is honoured
 	released sync.Once
 	queries  atomic.Uint32
 }
@@ -497,6 +550,12 @@ func (c *trackedConn) nextQuery(max uint32) bool {
 	return n <= max
 }
 
+// lastQuery reports whether the query just admitted by nextQuery was the final
+// one allowed on this connection, so it can be answered and then closed cleanly.
+func (c *trackedConn) lastQuery(max uint32) bool {
+	return max != 0 && c.queries.Load() == max
+}
+
 type guardedListener struct {
 	inner net.Listener
 	guard *Guard
@@ -512,14 +571,21 @@ func (l *guardedListener) Accept() (net.Conn, error) {
 			_ = conn.Close()
 			continue
 		}
-		source, ok := sourceKey(conn.RemoteAddr())
+		ip, ok := sourceIP(conn.RemoteAddr())
 		if !ok {
 			l.guard.releaseGlobal()
 			_ = conn.Close()
 			continue
 		}
-		_, ok = l.guard.states.admitConn(source, l.guard.cfg.MaxPerIPConns, time.Now(), l.guard.cfg.Rate, l.guard.cfg.Burst)
-		if !ok {
+		source := canonicalIPKey(ip)
+		// A platform-internal peer multiplexes many real users, so it is
+		// bounded by the global cap instead of the per-source cap.
+		trusted := l.guard.cfg.ClientIPHeader != "" && isInternalIP(ip)
+		maxConns := l.guard.cfg.MaxPerIPConns
+		if trusted {
+			maxConns = int32(min(l.guard.cfg.MaxGlobalConns, maxInt32))
+		}
+		if !l.guard.states.admitConn(source, maxConns, time.Now(), l.guard.cfg.Burst) {
 			_ = conn.Close()
 			l.guard.releaseGlobal()
 			continue
@@ -528,7 +594,7 @@ func (l *guardedListener) Accept() (net.Conn, error) {
 			_ = tcp.SetKeepAlive(true)
 			_ = tcp.SetKeepAlivePeriod(30 * time.Second)
 		}
-		return &trackedConn{Conn: conn, guard: l.guard, source: source}, nil
+		return &trackedConn{Conn: conn, guard: l.guard, source: source, trusted: trusted}, nil
 	}
 }
 
@@ -545,15 +611,23 @@ func (g *Guard) Handler() http.Handler {
 			return
 		}
 		if !state.nextQuery(g.cfg.MaxQueriesPerConn) {
-			g.dropHTTP(w)
+			g.reject(w, state, http.StatusTooManyRequests)
 			return
 		}
-		if !g.states.allow(state.source, time.Now(), g.cfg.Rate, g.cfg.Burst) {
-			g.dropHTTP(w)
+		// Behind the platform proxy every user shares the proxy's address, so the
+		// real client is taken from the forwarding header (see clientIPFromHeader).
+		client := state.source
+		if state.trusted {
+			if ip, ok := clientIPFromHeader(r.Header, g.cfg.ClientIPHeader); ok {
+				client = canonicalIPKey(ip)
+			}
+		}
+		if !g.states.allow(client, time.Now(), g.cfg.Rate, g.cfg.Burst) {
+			g.reject(w, state, http.StatusTooManyRequests)
 			return
 		}
 		if !g.acquireRequest() {
-			g.dropHTTP(w)
+			g.reject(w, state, http.StatusTooManyRequests)
 			return
 		}
 		defer g.releaseRequest()
@@ -567,36 +641,35 @@ func (g *Guard) Handler() http.Handler {
 				w.WriteHeader(http.StatusOK)
 				return
 			}
-			g.dropHTTP(w)
+			g.reject(w, state, http.StatusNotFound)
 			return
 		}
-		if r.Header.Get("Upgrade") != "" || r.Method == http.MethodConnect {
-			g.dropHTTP(w)
+		if r.Header.Get("Upgrade") != "" {
+			g.reject(w, state, http.StatusBadRequest)
 			return
 		}
 
 		body, err := g.readDoHBody(r)
 		if err != nil {
-			g.dropHTTP(w)
+			g.reject(w, state, http.StatusBadRequest)
 			return
 		}
 
 		ctx, cancel := context.WithTimeout(r.Context(), g.cfg.BackendTimeout)
 		defer cancel()
 		var requestBody io.Reader
+		backendURI := g.cfg.DOHPath
 		if r.Method == http.MethodPost {
 			requestBody = bytes.NewReader(body)
-		}
-		backendURI := g.cfg.DOHPath
-		if r.Method == http.MethodGet {
+		} else {
 			backendURI += "?dns=" + base64.RawURLEncoding.EncodeToString(body)
 		}
 		backendReq, err := http.NewRequestWithContext(ctx, r.Method, "http://"+g.cfg.BackendHTTP+backendURI, requestBody)
 		if err != nil {
-			g.dropHTTP(w)
+			g.reject(w, state, http.StatusBadGateway)
 			return
 		}
-		backendReq.Header.Set("X-Forwarded-For", state.source)
+		backendReq.Header.Set("X-Forwarded-For", client)
 		if accept := r.Header.Get("Accept"); accept != "" {
 			backendReq.Header.Set("Accept", accept)
 		}
@@ -606,17 +679,17 @@ func (g *Guard) Handler() http.Handler {
 
 		resp, err := g.backend.Do(backendReq)
 		if err != nil {
-			g.dropHTTP(w)
+			g.reject(w, state, http.StatusBadGateway)
 			return
 		}
 		defer resp.Body.Close()
 		if resp.ContentLength > g.cfg.MaxResponseBytes {
-			g.dropHTTP(w)
+			g.reject(w, state, http.StatusBadGateway)
 			return
 		}
 		responseBody, err := io.ReadAll(io.LimitReader(resp.Body, g.cfg.MaxResponseBytes+1))
 		if err != nil || int64(len(responseBody)) > g.cfg.MaxResponseBytes {
-			g.dropHTTP(w)
+			g.reject(w, state, http.StatusBadGateway)
 			return
 		}
 		hopByHop := responseHopByHopHeaders(resp.Header)
@@ -628,9 +701,13 @@ func (g *Guard) Handler() http.Handler {
 				w.Header().Add(k, value)
 			}
 		}
+		if state.lastQuery(g.cfg.MaxQueriesPerConn) {
+			// Serve the final allowed query, then close, so the peer reconnects
+			// instead of seeing a dropped request.
+			w.Header().Set("Connection", "close")
+		}
 		w.WriteHeader(resp.StatusCode)
 		_, _ = w.Write(responseBody)
-
 	})
 }
 
@@ -663,37 +740,49 @@ func (g *Guard) readDoHBody(r *http.Request) ([]byte, error) {
 	if r.Method == http.MethodGet {
 		encoded := r.URL.Query().Get("dns")
 		if encoded == "" {
-			return nil, fmt.Errorf("missing dns query parameter")
+			return nil, errors.New("missing dns query parameter")
 		}
-		var body []byte
-		var err error
-		body, err = base64.RawURLEncoding.DecodeString(encoded)
+		body, err := base64.RawURLEncoding.DecodeString(encoded)
 		if err != nil {
 			body, err = base64.URLEncoding.DecodeString(encoded)
 		}
 		if err != nil || len(body) == 0 || len(body) > g.cfg.MaxDNSMessage {
-			return nil, fmt.Errorf("invalid dns query size")
+			return nil, errors.New("invalid dns query size")
 		}
 		return body, nil
 	}
 
 	contentType := r.Header.Get("Content-Type")
 	if contentType == "" {
-		return nil, fmt.Errorf("missing content type")
+		return nil, errors.New("missing content type")
 	}
 	mediaType, _, err := mime.ParseMediaType(contentType)
 	if err != nil || !strings.EqualFold(mediaType, "application/dns-message") {
-		return nil, fmt.Errorf("invalid content type")
+		return nil, errors.New("invalid content type")
 	}
 	if r.ContentLength > int64(g.cfg.MaxDNSMessage) {
-		return nil, fmt.Errorf("oversized dns message")
+		return nil, errors.New("oversized dns message")
 	}
 	limited := io.LimitReader(r.Body, int64(g.cfg.MaxDNSMessage)+1)
 	body, err := io.ReadAll(limited)
 	if err != nil || len(body) == 0 || len(body) > g.cfg.MaxDNSMessage {
-		return nil, fmt.Errorf("invalid dns message size")
+		return nil, errors.New("invalid dns message size")
 	}
 	return body, nil
+}
+
+// reject refuses a request. Direct clients are silently disconnected; a
+// platform-internal proxy shares its connection between many users, so it gets
+// a real status code and keeps the connection instead.
+func (g *Guard) reject(w http.ResponseWriter, state *trackedConn, status int) {
+	if state != nil && state.trusted {
+		if status == http.StatusTooManyRequests {
+			w.Header().Set("Retry-After", "1")
+		}
+		w.WriteHeader(status)
+		return
+	}
+	g.dropHTTP(w)
 }
 
 func (g *Guard) dropHTTP(w http.ResponseWriter) {
@@ -764,13 +853,13 @@ func runHealthcheck() error {
 		return err
 	}
 	if n < 12 {
-		return fmt.Errorf("short healthcheck response")
+		return errors.New("short healthcheck response")
 	}
 	if buf[0] != 0x12 || buf[1] != 0x34 {
-		return fmt.Errorf("healthcheck transaction mismatch")
+		return errors.New("healthcheck transaction mismatch")
 	}
 	if buf[2]&0x80 == 0 || buf[3]&0x0f != 0 {
-		return fmt.Errorf("healthcheck status failed")
+		return errors.New("healthcheck status failed")
 	}
 	return nil
 }
@@ -787,7 +876,6 @@ func main() {
 	cfg := loadGuardConfig()
 	guard := NewGuard(cfg)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 
 	blocky := exec.Command("/app/blocky")
 	blocky.Stdout = os.Stdout
@@ -795,37 +883,99 @@ func main() {
 	// Keep the public guard's small heap target separate from Blocky's resolver
 	// and cache heap. Both processes inherit the container environment, so give
 	// the child its own explicit bounded target.
-	blockyGOMEMLIMIT := envString("BLOCKY_GOMEMLIMIT", "288MiB")
 	blocky.Env = append(os.Environ(),
-		"GOMEMLIMIT="+blockyGOMEMLIMIT,
+		"GOMEMLIMIT="+envString("BLOCKY_GOMEMLIMIT", defaultBlockyMemLimit),
 		"GOMAXPROCS=1",
 	)
 	if err := blocky.Start(); err != nil {
 		fmt.Fprintln(os.Stderr, "start blocky:", err)
+		stop()
 		os.Exit(1)
 	}
 
-	errCh := make(chan error, 1)
-	go func() { errCh <- guard.Run(ctx) }()
+	type blockyResult struct {
+		err        error
+		unexpected bool
+	}
+
+	guardDone := make(chan error, 1)
+	blockyDone := make(chan blockyResult, 1)
+	var blockyMu sync.Mutex
+	blockyTerminationRequested := false
+	go func() { guardDone <- guard.Run(ctx) }()
 	go func() {
-		errCh <- blocky.Wait()
+		err := blocky.Wait()
+		blockyMu.Lock()
+		unexpected := !blockyTerminationRequested
+		blockyMu.Unlock()
+		blockyDone <- blockyResult{err: err, unexpected: unexpected}
 	}()
 
+	exitCode := 0
+	blockyExited := false
+	blockyResultSeen := false
+	var br blockyResult
 	select {
 	case <-ctx.Done():
-	case err := <-errCh:
+		// Context cancellation and a guard failure can become ready at the
+		// same time. Wait for Guard first so a real guard failure cannot be
+		// hidden by select choosing ctx.Done().
+		if err := <-guardDone; err != nil {
+			fmt.Fprintln(os.Stderr, "guard stopped:", err)
+			exitCode = 1
+		}
+	case err := <-guardDone:
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "service stopped:", err)
+			fmt.Fprintln(os.Stderr, "guard stopped:", err)
+			exitCode = 1
 		}
 		stop()
-	}
-
-	if blocky.ProcessState == nil || blocky.ProcessState.Exited() == false {
-		_ = blocky.Process.Signal(syscall.SIGTERM)
-		select {
-		case <-time.After(2 * time.Second):
-			_ = blocky.Process.Kill()
-		case <-errCh:
+	case result := <-blockyDone:
+		blockyExited = true
+		blockyResultSeen = true
+		br = result
+		if result.unexpected {
+			fmt.Fprintln(os.Stderr, "blocky exited:", result.err)
+			exitCode = 1
 		}
 	}
+	stop()
+
+	if !blockyExited {
+		// Hold the state lock while requesting termination. The Blocky waiter
+		// takes the same lock after Wait returns, so an exit racing with the
+		// shutdown request is classified consistently without touching
+		// ProcessState from the supervisor.
+		blockyMu.Lock()
+		signalErr := blocky.Process.Signal(syscall.SIGTERM)
+		if signalErr == nil {
+			blockyTerminationRequested = true
+		}
+		blockyMu.Unlock()
+
+		if signalErr != nil {
+			fmt.Fprintln(os.Stderr, "stop blocky:", signalErr)
+		}
+		select {
+		case result := <-blockyDone:
+			blockyExited = true
+			blockyResultSeen = true
+			br = result
+		case <-time.After(5 * time.Second):
+			_ = blocky.Process.Kill()
+			br = <-blockyDone
+			blockyExited = true
+			blockyResultSeen = true
+		}
+	}
+
+	if blockyResultSeen && br.unexpected {
+		fmt.Fprintln(os.Stderr, "blocky exited:", br.err)
+		exitCode = 1
+	}
+	if !blockyExited {
+		// Unreachable, kept as a defensive guard for future changes.
+		exitCode = 1
+	}
+	os.Exit(exitCode)
 }
