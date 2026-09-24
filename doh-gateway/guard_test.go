@@ -14,6 +14,22 @@ import (
 	"time"
 )
 
+func testDNSResponse() []byte {
+	return []byte{
+		0x00, 0x01, // transaction ID used by the test DoH requests
+		0x81, 0x80, // response, no error
+		0x00, 0x01, 0x00, 0x01, // one question and one answer
+		0x00, 0x00, 0x00, 0x00,
+		0x07, 'e', 'x', 'a', 'm', 'p', 'l', 'e',
+		0x03, 'c', 'o', 'm', 0x00,
+		0x00, 0x01, 0x00, 0x01, // A, IN
+		0xc0, 0x0c, // compressed owner name -> example.com
+		0x00, 0x01, 0x00, 0x01,
+		0x00, 0x00, 0x01, 0x2c, // TTL 300
+		0x00, 0x04, 0x01, 0x02, 0x03, 0x04,
+	}
+}
+
 // stateCount is a test-only view of the total tracked source states.
 func (t *sourceTable) stateCount() int {
 	n := 0
@@ -48,6 +64,58 @@ func TestDefaultGuardRateAndBurst(t *testing.T) {
 	}
 	if cfg.Burst < cfg.Rate {
 		t.Fatalf("default burst = %v is below default rate = %v", cfg.Burst, cfg.Rate)
+	}
+}
+
+func TestDefaultStrictDoHProfile(t *testing.T) {
+	cfg := defaultGuardConfig()
+	if cfg.Rate != 12 || cfg.Burst != 200 {
+		t.Fatalf("DoH rate/burst = %v/%v, want 12/200", cfg.Rate, cfg.Burst)
+	}
+	if cfg.GlobalRate != 80 || cfg.GlobalBurst != 200 {
+		t.Fatalf("global rate/burst = %v/%v, want 80/200", cfg.GlobalRate, cfg.GlobalBurst)
+	}
+	if cfg.MaxPerIPConns != 32 {
+		t.Fatalf("per-IP connections = %d, want 32", cfg.MaxPerIPConns)
+	}
+	if cfg.BackendTimeout != 6*time.Second {
+		t.Fatalf("server timeout = %s, want 6s", cfg.BackendTimeout)
+	}
+}
+
+func TestStrictDoHEnvironmentOverrides(t *testing.T) {
+	t.Setenv("DOH_RATE_LIMIT", "13")
+	t.Setenv("DOH_RATE_BURST", "201")
+	t.Setenv("GLOBAL_RATE_LIMIT", "81")
+	t.Setenv("GLOBAL_RATE_BURST", "202")
+	t.Setenv("IP_CONN_LIMIT", "33")
+	t.Setenv("SERVER_TIMEOUT", "7")
+	// Legacy variables must not override the canonical strict-DoH settings.
+	t.Setenv("GUARD_RATE", "1")
+	t.Setenv("GUARD_BURST", "2")
+	t.Setenv("GUARD_MAX_IP_CONNS", "3")
+	t.Setenv("GUARD_BACKEND_TIMEOUT", "1s")
+
+	cfg := loadGuardConfig()
+	if cfg.Rate != 13 || cfg.Burst != 201 || cfg.GlobalRate != 81 || cfg.GlobalBurst != 202 {
+		t.Fatalf("strict DoH env override mismatch: rate=%v/%v global=%v/%v", cfg.Rate, cfg.Burst, cfg.GlobalRate, cfg.GlobalBurst)
+	}
+	if cfg.MaxPerIPConns != 33 || cfg.BackendTimeout != 7*time.Second {
+		t.Fatalf("strict DoH env connection/timeout mismatch: ip-conns=%d timeout=%s", cfg.MaxPerIPConns, cfg.BackendTimeout)
+	}
+}
+
+func TestGlobalRateLimit(t *testing.T) {
+	b := newTokenBucket(1, 2)
+	now := time.Now()
+	if !b.allow(now) || !b.allow(now) {
+		t.Fatal("global burst did not allow two immediate requests")
+	}
+	if b.allow(now) {
+		t.Fatal("global rate limiter allowed a request over burst")
+	}
+	if !b.allow(now.Add(time.Second)) {
+		t.Fatal("global rate limiter did not replenish at the configured rate")
 	}
 }
 
@@ -217,7 +285,7 @@ func TestDoHProxySanitizesForwardedClientIP(t *testing.T) {
 			t.Fatalf("backend saw spoofable client IP header %q", got)
 		}
 		w.Header().Set("Content-Type", "application/dns-message")
-		_, _ = w.Write([]byte{0x01, 0x02})
+		_, _ = w.Write(testDNSResponse())
 	}))
 	defer backend.Close()
 
@@ -328,7 +396,7 @@ func TestEnvUint32RejectsOverflowAndNegative(t *testing.T) {
 func TestDoHRateLimitCannotBeFragmentedByHost(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/dns-message")
-		_, _ = w.Write([]byte{0x01, 0x02})
+		_, _ = w.Write(testDNSResponse())
 	}))
 	defer backend.Close()
 
@@ -385,7 +453,7 @@ func TestDoHProxyNormalizesGETQueryAndBackendHost(t *testing.T) {
 			t.Errorf("backend Host = %q, want %q", got, expectedHost)
 		}
 		w.Header().Set("Content-Type", "application/dns-message")
-		_, _ = w.Write([]byte{0x01, 0x02})
+		_, _ = w.Write(testDNSResponse())
 	}))
 	defer backend.Close()
 
@@ -465,7 +533,7 @@ func TestDoHProxyRejectsOversizedBackendResponseHeaders(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Oversized", strings.Repeat("x", 32*1024))
 		w.Header().Set("Content-Type", "application/dns-message")
-		_, _ = w.Write([]byte{0x01, 0x02})
+		_, _ = w.Write(testDNSResponse())
 	}))
 	defer backend.Close()
 
@@ -492,7 +560,7 @@ func TestDoHProxyRejectsOversizedBackendResponseHeaders(t *testing.T) {
 	req = req.WithContext(context.WithValue(req.Context(), connStateKey{}, &trackedConn{source: "192.0.2.79", guard: g}))
 	w := httptest.NewRecorder()
 	g.Handler().ServeHTTP(w, req)
-	if w.Code != http.StatusTooManyRequests {
+	if w.Code != http.StatusBadGateway {
 		t.Fatalf("unexpected status: %d", w.Code)
 	}
 }
@@ -528,7 +596,7 @@ func TestDoHProxyRejectsUnknownLengthOversizedBackendResponse(t *testing.T) {
 	req = req.WithContext(context.WithValue(req.Context(), connStateKey{}, &trackedConn{source: "192.0.2.82", guard: g}))
 	w := httptest.NewRecorder()
 	g.Handler().ServeHTTP(w, req)
-	if w.Code != http.StatusTooManyRequests {
+	if w.Code != http.StatusBadGateway {
 		t.Fatalf("unexpected status: %d", w.Code)
 	}
 }
@@ -587,7 +655,7 @@ func TestDoHProxyDoesNotForwardStandardHopByHopHeaders(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/dns-message")
 		w.Header().Set("X-End-To-End", "keep")
-		_, _ = w.Write([]byte{0x01, 0x02})
+		_, _ = w.Write(testDNSResponse())
 	}))
 	defer backend.Close()
 
@@ -641,7 +709,7 @@ func TestDoHProxyDoesNotForwardConnectionNominatedHeaders(t *testing.T) {
 		w.Header().Set("X-Backend-Only", "secret")
 		w.Header().Set("X-End-To-End", "keep")
 		w.Header().Set("Content-Type", "application/dns-message")
-		_, _ = w.Write([]byte{0x01, 0x02})
+		_, _ = w.Write(testDNSResponse())
 	}))
 	defer backend.Close()
 
@@ -743,7 +811,7 @@ func TestTrustedProxyRateLimitsByForwardedClient(t *testing.T) {
 			t.Errorf("backend saw client %q", got)
 		}
 		w.Header().Set("Content-Type", "application/dns-message")
-		_, _ = w.Write([]byte{0x01, 0x02})
+		_, _ = w.Write(testDNSResponse())
 	}))
 	defer backend.Close()
 
@@ -781,7 +849,7 @@ func TestTrustedProxyRateLimitsByForwardedClient(t *testing.T) {
 func TestLastQueryClosesConnectionGracefully(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/dns-message")
-		_, _ = w.Write([]byte{0x01, 0x02})
+		_, _ = w.Write(testDNSResponse())
 	}))
 	defer backend.Close()
 
@@ -810,5 +878,108 @@ func TestLastQueryClosesConnectionGracefully(t *testing.T) {
 	}
 	if w := serve(); w.Code != http.StatusTooManyRequests {
 		t.Fatalf("query over the cap: status=%d", w.Code)
+	}
+}
+
+func TestClientDisconnectIsNotConvertedTo502(t *testing.T) {
+	var backendHits atomic.Int64
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backendHits.Add(1)
+		w.Header().Set("Content-Type", "application/dns-message")
+		_, _ = w.Write(testDNSResponse())
+	}))
+	defer backend.Close()
+
+	cfg := defaultGuardConfig()
+	cfg.BackendHTTP = strings.TrimPrefix(backend.URL, "http://")
+	g := NewGuard(cfg)
+	const source = "192.0.2.91"
+	if !g.states.admitConn(source, cfg.MaxPerIPConns, time.Now(), cfg.Burst) || !g.admitGlobal() {
+		t.Fatal("request admission failed")
+	}
+	defer func() {
+		g.states.releaseConn(source)
+		g.releaseGlobal()
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://guard/dns-query?dns=AAE", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := &trackedConn{source: source, guard: g}
+	req = req.WithContext(context.WithValue(req.Context(), connStateKey{}, conn))
+	w := httptest.NewRecorder()
+	g.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK || w.Body.Len() != 0 {
+		t.Fatalf("cancelled request produced a response: status=%d body=%q", w.Code, w.Body.String())
+	}
+	if hits := backendHits.Load(); hits != 0 {
+		t.Fatalf("cancelled request reached backend: hits=%d", hits)
+	}
+}
+
+func TestBackendTimeoutReturns502(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(50 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/dns-message")
+		_, _ = w.Write(testDNSResponse())
+	}))
+	defer backend.Close()
+
+	cfg := defaultGuardConfig()
+	cfg.BackendTimeout = 10 * time.Millisecond
+	cfg.BackendHTTP = strings.TrimPrefix(backend.URL, "http://")
+	g := NewGuard(cfg)
+	const source = "192.0.2.92"
+	if !g.states.admitConn(source, cfg.MaxPerIPConns, time.Now(), cfg.Burst) || !g.admitGlobal() {
+		t.Fatal("request admission failed")
+	}
+	defer func() {
+		g.states.releaseConn(source)
+		g.releaseGlobal()
+	}()
+
+	req, err := http.NewRequest(http.MethodGet, "http://guard/dns-query?dns=AAE", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req = req.WithContext(context.WithValue(req.Context(), connStateKey{}, &trackedConn{source: source, guard: g}))
+	w := httptest.NewRecorder()
+	g.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("backend timeout status=%d, want %d", w.Code, http.StatusBadGateway)
+	}
+}
+
+func TestInvalidBackendDNSResponseReturns502(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/dns-message")
+		_, _ = w.Write([]byte{0x00, 0x01, 0x81})
+	}))
+	defer backend.Close()
+
+	cfg := defaultGuardConfig()
+	cfg.BackendHTTP = strings.TrimPrefix(backend.URL, "http://")
+	g := NewGuard(cfg)
+	const source = "192.0.2.93"
+	if !g.states.admitConn(source, cfg.MaxPerIPConns, time.Now(), cfg.Burst) || !g.admitGlobal() {
+		t.Fatal("request admission failed")
+	}
+	defer func() {
+		g.states.releaseConn(source)
+		g.releaseGlobal()
+	}()
+
+	req, err := http.NewRequest(http.MethodGet, "http://guard/dns-query?dns=AAE", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req = req.WithContext(context.WithValue(req.Context(), connStateKey{}, &trackedConn{source: source, guard: g}))
+	w := httptest.NewRecorder()
+	g.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("invalid backend DNS response status=%d, want %d", w.Code, http.StatusBadGateway)
 	}
 }

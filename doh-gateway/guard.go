@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"hash/maphash"
@@ -27,10 +28,12 @@ const (
 	defaultListenAddr       = ":4001"
 	defaultBackendHTTP      = "127.0.0.1:4002"
 	defaultDohPath          = "/dns-query"
-	defaultRate             = 10.0 // sustained requests per second per client
-	defaultBurst            = 100.0
+	defaultRate             = 12.0  // DOH_RATE_LIMIT: sustained requests per second per client
+	defaultBurst            = 200.0 // DOH_RATE_BURST: per-client burst capacity
+	defaultGlobalRate       = 80.0  // GLOBAL_RATE_LIMIT: aggregate requests per second
+	defaultGlobalBurst      = 200.0 // GLOBAL_RATE_BURST: aggregate burst capacity
 	defaultGlobalConns      = 512
-	defaultPerIPConns       = 16
+	defaultPerIPConns       = 32 // IP_CONN_LIMIT: per-source concurrent connections
 	defaultMaxSourceStates  = 16384
 	defaultMaxDNSMessage    = 4096
 	defaultMaxQueriesConn   = 1024
@@ -41,7 +44,7 @@ const (
 	defaultReadTimeout      = 10 * time.Second
 	defaultWriteTimeout     = 10 * time.Second
 	defaultIdleTimeout      = 60 * time.Second
-	defaultBackendTimeout   = 5 * time.Second
+	defaultBackendTimeout   = 6 * time.Second // SERVER_TIMEOUT: backend query deadline
 	defaultMaxRequests      = 64
 	defaultBlockyMemLimit   = "320MiB"
 
@@ -62,6 +65,8 @@ type GuardConfig struct {
 	ClientIPHeader    string
 	Rate              float64
 	Burst             float64
+	GlobalRate        float64
+	GlobalBurst       float64
 	MaxGlobalConns    int64
 	MaxPerIPConns     int32
 	MaxSourceStates   int
@@ -85,6 +90,8 @@ func defaultGuardConfig() GuardConfig {
 		DOHPath:           defaultDohPath,
 		Rate:              defaultRate,
 		Burst:             defaultBurst,
+		GlobalRate:        defaultGlobalRate,
+		GlobalBurst:       defaultGlobalBurst,
 		MaxGlobalConns:    defaultGlobalConns,
 		MaxPerIPConns:     defaultPerIPConns,
 		MaxSourceStates:   defaultMaxSourceStates,
@@ -108,10 +115,12 @@ func loadGuardConfig() GuardConfig {
 	c.BackendHTTP = envString("GUARD_BACKEND", c.BackendHTTP)
 	c.DOHPath = envString("GUARD_DOH_PATH", c.DOHPath)
 	c.ClientIPHeader = http.CanonicalHeaderKey(envString("GUARD_CLIENT_IP_HEADER", c.ClientIPHeader))
-	c.Rate = envFloat("GUARD_RATE", c.Rate)
-	c.Burst = envFloat("GUARD_BURST", c.Burst)
+	c.Rate = envFloat("DOH_RATE_LIMIT", envFloat("GUARD_RATE", c.Rate))
+	c.Burst = envFloat("DOH_RATE_BURST", envFloat("GUARD_BURST", c.Burst))
+	c.GlobalRate = envFloat("GLOBAL_RATE_LIMIT", c.GlobalRate)
+	c.GlobalBurst = envFloat("GLOBAL_RATE_BURST", c.GlobalBurst)
 	c.MaxGlobalConns = envInt64("GUARD_MAX_GLOBAL_CONNS", c.MaxGlobalConns)
-	c.MaxPerIPConns = int32(envInt64("GUARD_MAX_IP_CONNS", int64(c.MaxPerIPConns)))
+	c.MaxPerIPConns = int32(envInt64("IP_CONN_LIMIT", envInt64("GUARD_MAX_IP_CONNS", int64(c.MaxPerIPConns))))
 	c.MaxSourceStates = int(envInt64("GUARD_MAX_IP_STATES", int64(c.MaxSourceStates)))
 	c.MaxDNSMessage = int(envInt64("GUARD_MAX_DNS_MESSAGE", int64(c.MaxDNSMessage)))
 	c.MaxQueriesPerConn = envUint32("GUARD_MAX_QUERIES_PER_CONN", c.MaxQueriesPerConn)
@@ -121,7 +130,7 @@ func loadGuardConfig() GuardConfig {
 	c.ReadTimeout = envDuration("GUARD_READ_TIMEOUT", c.ReadTimeout)
 	c.WriteTimeout = envDuration("GUARD_WRITE_TIMEOUT", c.WriteTimeout)
 	c.IdleTimeout = envDuration("GUARD_IDLE_TIMEOUT", c.IdleTimeout)
-	c.BackendTimeout = envDuration("GUARD_BACKEND_TIMEOUT", c.BackendTimeout)
+	c.BackendTimeout = envSecondsOrDuration("SERVER_TIMEOUT", envDuration("GUARD_BACKEND_TIMEOUT", c.BackendTimeout))
 	c.MaxHeaderBytes = int(envInt64("GUARD_MAX_HEADER_BYTES", int64(c.MaxHeaderBytes)))
 	c.MaxResponseBytes = envInt64("GUARD_MAX_RESPONSE_BYTES", c.MaxResponseBytes)
 	c.normalize()
@@ -148,6 +157,17 @@ func (c *GuardConfig) normalize() {
 	}
 	if c.Burst < c.Rate {
 		c.Burst = c.Rate
+	}
+	if c.GlobalRate <= 0 || math.IsNaN(c.GlobalRate) || math.IsInf(c.GlobalRate, 0) {
+		c.GlobalRate = defaultGlobalRate
+	}
+	if c.GlobalBurst <= 0 {
+		c.GlobalBurst = c.GlobalRate
+	} else if math.IsNaN(c.GlobalBurst) || math.IsInf(c.GlobalBurst, 0) {
+		c.GlobalBurst = defaultGlobalBurst
+	}
+	if c.GlobalBurst < c.GlobalRate {
+		c.GlobalBurst = c.GlobalRate
 	}
 	if c.MaxGlobalConns < 1 {
 		c.MaxGlobalConns = defaultGlobalConns
@@ -246,6 +266,21 @@ func envDuration(name string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	return n
+}
+
+func envSecondsOrDuration(name string, fallback time.Duration) time.Duration {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return fallback
+	}
+	if n, err := time.ParseDuration(v); err == nil {
+		return n
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n <= 0 || n > int64((time.Duration(1<<63-1))/time.Second) {
+		return fallback
+	}
+	return time.Duration(n) * time.Second
 }
 
 type clientState struct {
@@ -389,12 +424,43 @@ func (t *sourceTable) releaseConn(key string) {
 	}
 }
 
+type tokenBucket struct {
+	mu     sync.Mutex
+	rate   float64
+	burst  float64
+	tokens float64
+	last   time.Time
+}
+
+func newTokenBucket(rate, burst float64) *tokenBucket {
+	now := time.Now()
+	return &tokenBucket{rate: rate, burst: burst, tokens: burst, last: now}
+}
+
+func (b *tokenBucket) allow(now time.Time) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if elapsed := now.Sub(b.last).Seconds(); elapsed > 0 {
+		b.tokens += elapsed * b.rate
+		if b.tokens > b.burst {
+			b.tokens = b.burst
+		}
+		b.last = now
+	}
+	if b.tokens < 1 {
+		return false
+	}
+	b.tokens--
+	return true
+}
+
 type Guard struct {
-	cfg       GuardConfig
-	states    *sourceTable
-	globalCon atomic.Int64
-	activeReq atomic.Int64
-	backend   *http.Client
+	cfg        GuardConfig
+	states     *sourceTable
+	globalRate *tokenBucket
+	globalCon  atomic.Int64
+	activeReq  atomic.Int64
+	backend    *http.Client
 }
 
 func NewGuard(cfg GuardConfig) *Guard {
@@ -415,8 +481,9 @@ func NewGuard(cfg GuardConfig) *Guard {
 	states := newSourceTable(cfg.MaxSourceStates)
 	states.stateIdle = cfg.StateIdle
 	return &Guard{
-		cfg:    cfg,
-		states: states,
+		cfg:        cfg,
+		states:     states,
+		globalRate: newTokenBucket(cfg.GlobalRate, cfg.GlobalBurst),
 		backend: &http.Client{
 			Transport: tr,
 			Timeout:   cfg.BackendTimeout,
@@ -622,7 +689,12 @@ func (g *Guard) Handler() http.Handler {
 				client = canonicalIPKey(ip)
 			}
 		}
-		if !g.states.allow(client, time.Now(), g.cfg.Rate, g.cfg.Burst) {
+		now := time.Now()
+		if !g.globalRate.allow(now) {
+			g.reject(w, state, http.StatusTooManyRequests)
+			return
+		}
+		if !g.states.allow(client, now, g.cfg.Rate, g.cfg.Burst) {
 			g.reject(w, state, http.StatusTooManyRequests)
 			return
 		}
@@ -651,6 +723,9 @@ func (g *Guard) Handler() http.Handler {
 
 		body, err := g.readDoHBody(r)
 		if err != nil {
+			if r.Context().Err() != nil {
+				return
+			}
 			g.reject(w, state, http.StatusBadRequest)
 			return
 		}
@@ -679,6 +754,12 @@ func (g *Guard) Handler() http.Handler {
 
 		resp, err := g.backend.Do(backendReq)
 		if err != nil {
+			// Browser navigation/network changes routinely cancel in-flight DoH
+			// requests. That is a normal client lifecycle event, not an upstream
+			// failure, so do not turn it into a synthetic 502 response.
+			if r.Context().Err() != nil {
+				return
+			}
 			g.reject(w, state, http.StatusBadGateway)
 			return
 		}
@@ -688,7 +769,18 @@ func (g *Guard) Handler() http.Handler {
 			return
 		}
 		responseBody, err := io.ReadAll(io.LimitReader(resp.Body, g.cfg.MaxResponseBytes+1))
-		if err != nil || int64(len(responseBody)) > g.cfg.MaxResponseBytes {
+		if err != nil {
+			if r.Context().Err() != nil {
+				return
+			}
+			g.reject(w, state, http.StatusBadGateway)
+			return
+		}
+		if int64(len(responseBody)) > g.cfg.MaxResponseBytes {
+			g.reject(w, state, http.StatusBadGateway)
+			return
+		}
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 && !validDNSResponse(body, responseBody) {
 			g.reject(w, state, http.StatusBadGateway)
 			return
 		}
@@ -771,10 +863,99 @@ func (g *Guard) readDoHBody(r *http.Request) ([]byte, error) {
 	return body, nil
 }
 
-// reject refuses a request. Direct clients are silently disconnected; a
-// platform-internal proxy shares its connection between many users, so it gets
-// a real status code and keeps the connection instead.
+func validDNSResponse(query, response []byte) bool {
+	if len(response) < 12 || len(query) < 2 {
+		return false
+	}
+	if response[0] != query[0] || response[1] != query[1] {
+		return false
+	}
+	if response[2]&0x80 == 0 {
+		return false
+	}
+	offset := 12
+	counts := [4]int{
+		int(binary.BigEndian.Uint16(response[4:6])),
+		int(binary.BigEndian.Uint16(response[6:8])),
+		int(binary.BigEndian.Uint16(response[8:10])),
+		int(binary.BigEndian.Uint16(response[10:12])),
+	}
+	var ok bool
+	for i := 0; i < counts[0]; i++ {
+		offset, ok = skipDNSName(response, offset)
+		if !ok || offset+4 > len(response) {
+			return false
+		}
+		offset += 4
+	}
+	for section := 1; section < 4; section++ {
+		for i := 0; i < counts[section]; i++ {
+			offset, ok = skipDNSName(response, offset)
+			if !ok || offset+10 > len(response) {
+				return false
+			}
+			rdLength := int(binary.BigEndian.Uint16(response[offset+8 : offset+10]))
+			offset += 10
+			if rdLength > len(response)-offset {
+				return false
+			}
+			offset += rdLength
+		}
+	}
+	return offset == len(response)
+}
+
+func skipDNSName(message []byte, offset int) (int, bool) {
+	if offset < 0 || offset >= len(message) {
+		return 0, false
+	}
+	pos := offset
+	jumps := 0
+	for {
+		if pos >= len(message) {
+			return 0, false
+		}
+		length := message[pos]
+		switch length & 0xc0 {
+		case 0x00:
+			pos++
+			if length == 0 {
+				if jumps > 0 {
+					return offset, true
+				}
+				return pos, true
+			}
+			if length > 63 || int(length) > len(message)-pos {
+				return 0, false
+			}
+			pos += int(length)
+		case 0xc0:
+			if pos+1 >= len(message) || jumps >= 128 {
+				return 0, false
+			}
+			target := int(length&0x3f)<<8 | int(message[pos+1])
+			if target >= len(message) {
+				return 0, false
+			}
+			if jumps == 0 {
+				offset = pos + 2
+			}
+			pos = target
+			jumps++
+		default:
+			return 0, false
+		}
+	}
+}
+
+// reject refuses a request. Direct clients are silently disconnected for
+// policy/rate/validation rejections, while backend failures are explicit 502s
+// so strict DoH clients can retry or report the lookup failure.
 func (g *Guard) reject(w http.ResponseWriter, state *trackedConn, status int) {
+	if status == http.StatusBadGateway {
+		w.WriteHeader(status)
+		return
+	}
 	if state != nil && state.trusted {
 		if status == http.StatusTooManyRequests {
 			w.Header().Set("Retry-After", "1")
