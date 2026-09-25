@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"hash/maphash"
 	"io"
-	"math"
 	"mime"
 	"net"
 	"net/http"
@@ -28,10 +27,6 @@ const (
 	defaultListenAddr       = ":4001"
 	defaultBackendHTTP      = "127.0.0.1:4002"
 	defaultDohPath          = "/dns-query"
-	defaultRate             = 12.0  // DOH_RATE_LIMIT: sustained requests per second per client
-	defaultBurst            = 200.0 // DOH_RATE_BURST: per-client burst capacity
-	defaultGlobalRate       = 80.0  // GLOBAL_RATE_LIMIT: aggregate requests per second
-	defaultGlobalBurst      = 200.0 // GLOBAL_RATE_BURST: aggregate burst capacity
 	defaultGlobalConns      = 512
 	defaultPerIPConns       = 32 // IP_CONN_LIMIT: per-source concurrent connections
 	defaultMaxSourceStates  = 16384
@@ -45,7 +40,8 @@ const (
 	defaultWriteTimeout     = 10 * time.Second
 	defaultIdleTimeout      = 60 * time.Second
 	defaultBackendTimeout   = 6 * time.Second // SERVER_TIMEOUT: backend query deadline
-	defaultMaxRequests      = 64
+	defaultMaxRequests      = 32
+	defaultMaxRequestsPerIP = 8
 	defaultBlockyMemLimit   = "320MiB"
 
 	stateShards = 64
@@ -59,53 +55,47 @@ const (
 // limiter. This layer protects the public socket/request path before Blocky parses
 // or resolves the DNS message.
 type GuardConfig struct {
-	ListenAddr        string
-	BackendHTTP       string
-	DOHPath           string
-	ClientIPHeader    string
-	Rate              float64
-	Burst             float64
-	GlobalRate        float64
-	GlobalBurst       float64
-	MaxGlobalConns    int64
-	MaxPerIPConns     int32
-	MaxSourceStates   int
-	MaxDNSMessage     int
-	MaxQueriesPerConn uint32
-	MaxConcurrentReqs int64
-	StateIdle         time.Duration
-	ReadHeaderTimeout time.Duration
-	ReadTimeout       time.Duration
-	WriteTimeout      time.Duration
-	IdleTimeout       time.Duration
-	BackendTimeout    time.Duration
-	MaxHeaderBytes    int
-	MaxResponseBytes  int64
+	ListenAddr             string
+	BackendHTTP            string
+	DOHPath                string
+	ClientIPHeader         string
+	MaxGlobalConns         int64
+	MaxPerIPConns          int32
+	MaxSourceStates        int
+	MaxDNSMessage          int
+	MaxQueriesPerConn      uint32
+	MaxConcurrentReqs      int64
+	MaxConcurrentReqsPerIP int32
+	StateIdle              time.Duration
+	ReadHeaderTimeout      time.Duration
+	ReadTimeout            time.Duration
+	WriteTimeout           time.Duration
+	IdleTimeout            time.Duration
+	BackendTimeout         time.Duration
+	MaxHeaderBytes         int
+	MaxResponseBytes       int64
 }
 
 func defaultGuardConfig() GuardConfig {
 	return GuardConfig{
-		ListenAddr:        defaultListenAddr,
-		BackendHTTP:       defaultBackendHTTP,
-		DOHPath:           defaultDohPath,
-		Rate:              defaultRate,
-		Burst:             defaultBurst,
-		GlobalRate:        defaultGlobalRate,
-		GlobalBurst:       defaultGlobalBurst,
-		MaxGlobalConns:    defaultGlobalConns,
-		MaxPerIPConns:     defaultPerIPConns,
-		MaxSourceStates:   defaultMaxSourceStates,
-		MaxDNSMessage:     defaultMaxDNSMessage,
-		MaxQueriesPerConn: defaultMaxQueriesConn,
-		MaxConcurrentReqs: defaultMaxRequests,
-		StateIdle:         defaultStateIdle,
-		ReadHeaderTimeout: defaultReadHeader,
-		ReadTimeout:       defaultReadTimeout,
-		WriteTimeout:      defaultWriteTimeout,
-		IdleTimeout:       defaultIdleTimeout,
-		BackendTimeout:    defaultBackendTimeout,
-		MaxHeaderBytes:    defaultMaxHeaderBytes,
-		MaxResponseBytes:  defaultResponseMaxBytes,
+		ListenAddr:             defaultListenAddr,
+		BackendHTTP:            defaultBackendHTTP,
+		DOHPath:                defaultDohPath,
+		MaxGlobalConns:         defaultGlobalConns,
+		MaxPerIPConns:          defaultPerIPConns,
+		MaxSourceStates:        defaultMaxSourceStates,
+		MaxDNSMessage:          defaultMaxDNSMessage,
+		MaxQueriesPerConn:      defaultMaxQueriesConn,
+		MaxConcurrentReqs:      defaultMaxRequests,
+		MaxConcurrentReqsPerIP: defaultMaxRequestsPerIP,
+		StateIdle:              defaultStateIdle,
+		ReadHeaderTimeout:      defaultReadHeader,
+		ReadTimeout:            defaultReadTimeout,
+		WriteTimeout:           defaultWriteTimeout,
+		IdleTimeout:            defaultIdleTimeout,
+		BackendTimeout:         defaultBackendTimeout,
+		MaxHeaderBytes:         defaultMaxHeaderBytes,
+		MaxResponseBytes:       defaultResponseMaxBytes,
 	}
 }
 
@@ -114,24 +104,21 @@ func loadGuardConfig() GuardConfig {
 	c.ListenAddr = envString("GUARD_LISTEN", c.ListenAddr)
 	c.BackendHTTP = envString("GUARD_BACKEND", c.BackendHTTP)
 	c.DOHPath = envString("GUARD_DOH_PATH", c.DOHPath)
-	c.ClientIPHeader = http.CanonicalHeaderKey(envString("GUARD_CLIENT_IP_HEADER", c.ClientIPHeader))
-	c.Rate = envFloat("DOH_RATE_LIMIT", c.Rate)
-	c.Burst = envFloat("DOH_RATE_BURST", c.Burst)
-	c.GlobalRate = envFloat("GLOBAL_RATE_LIMIT", c.GlobalRate)
-	c.GlobalBurst = envFloat("GLOBAL_RATE_BURST", c.GlobalBurst)
+	c.ClientIPHeader = envHeader("GUARD_CLIENT_IP_HEADER", c.ClientIPHeader)
 	c.MaxGlobalConns = envInt64("GUARD_MAX_GLOBAL_CONNS", c.MaxGlobalConns)
-	c.MaxPerIPConns = int32(envInt64("IP_CONN_LIMIT", int64(c.MaxPerIPConns)))
-	c.MaxSourceStates = int(envInt64("GUARD_MAX_IP_STATES", int64(c.MaxSourceStates)))
-	c.MaxDNSMessage = int(envInt64("GUARD_MAX_DNS_MESSAGE", int64(c.MaxDNSMessage)))
+	c.MaxPerIPConns = envInt32("IP_CONN_LIMIT", c.MaxPerIPConns)
+	c.MaxSourceStates = envInt("GUARD_MAX_IP_STATES", c.MaxSourceStates)
+	c.MaxDNSMessage = envInt("GUARD_MAX_DNS_MESSAGE", c.MaxDNSMessage)
 	c.MaxQueriesPerConn = envUint32("GUARD_MAX_QUERIES_PER_CONN", c.MaxQueriesPerConn)
 	c.MaxConcurrentReqs = envInt64("GUARD_MAX_CONCURRENT_REQS", c.MaxConcurrentReqs)
+	c.MaxConcurrentReqsPerIP = envInt32("GUARD_MAX_CONCURRENT_REQS_PER_IP", c.MaxConcurrentReqsPerIP)
 	c.StateIdle = envDuration("GUARD_STATE_IDLE", c.StateIdle)
 	c.ReadHeaderTimeout = envDuration("GUARD_READ_HEADER_TIMEOUT", c.ReadHeaderTimeout)
 	c.ReadTimeout = envDuration("GUARD_READ_TIMEOUT", c.ReadTimeout)
 	c.WriteTimeout = envDuration("GUARD_WRITE_TIMEOUT", c.WriteTimeout)
 	c.IdleTimeout = envDuration("GUARD_IDLE_TIMEOUT", c.IdleTimeout)
 	c.BackendTimeout = envSecondsOrDuration("SERVER_TIMEOUT", c.BackendTimeout)
-	c.MaxHeaderBytes = int(envInt64("GUARD_MAX_HEADER_BYTES", int64(c.MaxHeaderBytes)))
+	c.MaxHeaderBytes = envInt("GUARD_MAX_HEADER_BYTES", c.MaxHeaderBytes)
 	c.MaxResponseBytes = envInt64("GUARD_MAX_RESPONSE_BYTES", c.MaxResponseBytes)
 	c.normalize()
 	return c
@@ -146,28 +133,6 @@ func (c *GuardConfig) normalize() {
 	}
 	if c.DOHPath == "" || c.DOHPath[0] != '/' {
 		c.DOHPath = defaultDohPath
-	}
-	if c.Rate <= 0 || math.IsNaN(c.Rate) || math.IsInf(c.Rate, 0) {
-		c.Rate = defaultRate
-	}
-	if c.Burst <= 0 {
-		c.Burst = c.Rate
-	} else if math.IsNaN(c.Burst) || math.IsInf(c.Burst, 0) {
-		c.Burst = defaultBurst
-	}
-	if c.Burst < c.Rate {
-		c.Burst = c.Rate
-	}
-	if c.GlobalRate <= 0 || math.IsNaN(c.GlobalRate) || math.IsInf(c.GlobalRate, 0) {
-		c.GlobalRate = defaultGlobalRate
-	}
-	if c.GlobalBurst <= 0 {
-		c.GlobalBurst = c.GlobalRate
-	} else if math.IsNaN(c.GlobalBurst) || math.IsInf(c.GlobalBurst, 0) {
-		c.GlobalBurst = defaultGlobalBurst
-	}
-	if c.GlobalBurst < c.GlobalRate {
-		c.GlobalBurst = c.GlobalRate
 	}
 	if c.MaxGlobalConns < 1 {
 		c.MaxGlobalConns = defaultGlobalConns
@@ -184,8 +149,15 @@ func (c *GuardConfig) normalize() {
 	if c.MaxQueriesPerConn < 1 {
 		c.MaxQueriesPerConn = defaultMaxQueriesConn
 	}
-	if c.MaxConcurrentReqs < 1 {
+	maxPlatformInt := int64(^uint(0) >> 1)
+	if c.MaxConcurrentReqs < 1 || c.MaxConcurrentReqs > maxPlatformInt {
 		c.MaxConcurrentReqs = defaultMaxRequests
+	}
+	if c.MaxConcurrentReqsPerIP < 1 {
+		c.MaxConcurrentReqsPerIP = defaultMaxRequestsPerIP
+	}
+	if int64(c.MaxConcurrentReqsPerIP) > c.MaxConcurrentReqs {
+		c.MaxConcurrentReqsPerIP = int32(c.MaxConcurrentReqs)
 	}
 	if c.StateIdle <= 0 {
 		c.StateIdle = defaultStateIdle
@@ -232,16 +204,44 @@ func envInt64(name string, fallback int64) int64 {
 	return n
 }
 
-func envFloat(name string, fallback float64) float64 {
+func envInt(name string, fallback int) int {
 	v := strings.TrimSpace(os.Getenv(name))
 	if v == "" {
 		return fallback
 	}
-	n, err := strconv.ParseFloat(v, 64)
-	if err != nil {
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n < 0 || uint64(n) > uint64(^uint(0)>>1) {
 		return fallback
 	}
-	return n
+	return int(n)
+}
+
+func envInt32(name string, fallback int32) int32 {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n < 0 || n > int64(maxInt32) {
+		return fallback
+	}
+	return int32(n)
+}
+
+func envHeader(name, fallback string) string {
+	v, ok := os.LookupEnv(name)
+	if !ok {
+		return http.CanonicalHeaderKey(fallback)
+	}
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return ""
+	}
+	key := http.CanonicalHeaderKey(v)
+	if key == "" {
+		return http.CanonicalHeaderKey(fallback)
+	}
+	return key
 }
 
 func envUint32(name string, fallback uint32) uint32 {
@@ -284,10 +284,9 @@ func envSecondsOrDuration(name string, fallback time.Duration) time.Duration {
 }
 
 type clientState struct {
-	tokens   float64
-	last     time.Time
 	lastSeen time.Time
 	conns    int32
+	requests int32
 }
 
 type stateShard struct {
@@ -326,8 +325,8 @@ func newSourceTable(maxStates int) *sourceTable {
 }
 
 func (t *sourceTable) sourceHash(key string) uint64 {
-	// Randomized hashing prevents an external client from precomputing IPs that
-	// deliberately collide into the same shard and force churn in one bucket.
+	// Randomized hashing prevents an external client from deliberately concentrating
+	// many source keys in one shard and forcing avoidable state churn.
 	return maphash.String(t.seed, key)
 }
 
@@ -335,13 +334,13 @@ func (t *sourceTable) shard(key string) *stateShard {
 	return &t.shards[t.sourceHash(key)%uint64(t.shardCount)]
 }
 
-func (t *sourceTable) createLocked(shardIdx int, key string, now time.Time, burst float64) *clientState {
+func (t *sourceTable) createLocked(shardIdx int, key string, now time.Time) *clientState {
 	s := &t.shards[shardIdx]
 	if len(s.clients) >= t.shardLimit[shardIdx] {
 		var victimKey string
 		var victim *clientState
 		for k, candidate := range s.clients {
-			if candidate.conns != 0 {
+			if candidate.conns != 0 || candidate.requests != 0 {
 				continue
 			}
 			if now.Sub(candidate.lastSeen) >= t.stateIdle {
@@ -357,52 +356,52 @@ func (t *sourceTable) createLocked(shardIdx int, key string, now time.Time, burs
 		}
 		delete(s.clients, victimKey)
 	}
-	st := &clientState{tokens: burst, last: now, lastSeen: now}
+	st := &clientState{lastSeen: now}
 	s.clients[key] = st
 	return st
 }
 
-func (t *sourceTable) allow(key string, now time.Time, rate, burst float64) bool {
+func (t *sourceTable) admitRequest(key string, max int32, now time.Time) bool {
+	if max < 1 {
+		return false
+	}
 	shardIdx := t.sourceHash(key) % uint64(t.shardCount)
 	s := &t.shards[shardIdx]
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return t.allowLocked(s, int(shardIdx), key, now, rate, burst)
-}
-
-func (t *sourceTable) allowLocked(s *stateShard, shardIdx int, key string, now time.Time, rate, burst float64) bool {
 	st := s.clients[key]
 	if st == nil {
-		st = t.createLocked(shardIdx, key, now, burst)
+		st = t.createLocked(int(shardIdx), key, now)
 		if st == nil {
 			return false
 		}
 	}
-
-	elapsed := now.Sub(st.last).Seconds()
-	if elapsed > 0 {
-		st.tokens += elapsed * rate
-		if st.tokens > burst {
-			st.tokens = burst
-		}
-		st.last = now
-	}
-	st.lastSeen = now
-	if st.tokens < 1 {
+	if st.requests >= max {
 		return false
 	}
-	st.tokens--
+	st.requests++
+	st.lastSeen = now
 	return true
 }
 
-func (t *sourceTable) admitConn(key string, max int32, now time.Time, burst float64) bool {
+func (t *sourceTable) releaseRequest(key string) {
+	s := t.shard(key)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if st := s.clients[key]; st != nil && st.requests > 0 {
+		st.requests--
+		st.lastSeen = time.Now()
+	}
+}
+
+func (t *sourceTable) admitConn(key string, max int32, now time.Time) bool {
 	shardIdx := t.sourceHash(key) % uint64(t.shardCount)
 	s := &t.shards[shardIdx]
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	st := s.clients[key]
 	if st == nil {
-		st = t.createLocked(int(shardIdx), key, now, burst)
+		st = t.createLocked(int(shardIdx), key, now)
 		if st == nil {
 			return false
 		}
@@ -421,46 +420,16 @@ func (t *sourceTable) releaseConn(key string) {
 	defer s.mu.Unlock()
 	if st := s.clients[key]; st != nil && st.conns > 0 {
 		st.conns--
+		st.lastSeen = time.Now()
 	}
-}
-
-type tokenBucket struct {
-	mu     sync.Mutex
-	rate   float64
-	burst  float64
-	tokens float64
-	last   time.Time
-}
-
-func newTokenBucket(rate, burst float64) *tokenBucket {
-	now := time.Now()
-	return &tokenBucket{rate: rate, burst: burst, tokens: burst, last: now}
-}
-
-func (b *tokenBucket) allow(now time.Time) bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if elapsed := now.Sub(b.last).Seconds(); elapsed > 0 {
-		b.tokens += elapsed * b.rate
-		if b.tokens > b.burst {
-			b.tokens = b.burst
-		}
-		b.last = now
-	}
-	if b.tokens < 1 {
-		return false
-	}
-	b.tokens--
-	return true
 }
 
 type Guard struct {
-	cfg        GuardConfig
-	states     *sourceTable
-	globalRate *tokenBucket
-	globalCon  atomic.Int64
-	activeReq  atomic.Int64
-	backend    *http.Client
+	cfg       GuardConfig
+	states    *sourceTable
+	globalCon atomic.Int64
+	activeReq atomic.Int64
+	backend   *http.Client
 }
 
 func NewGuard(cfg GuardConfig) *Guard {
@@ -481,9 +450,8 @@ func NewGuard(cfg GuardConfig) *Guard {
 	states := newSourceTable(cfg.MaxSourceStates)
 	states.stateIdle = cfg.StateIdle
 	return &Guard{
-		cfg:        cfg,
-		states:     states,
-		globalRate: newTokenBucket(cfg.GlobalRate, cfg.GlobalBurst),
+		cfg:    cfg,
+		states: states,
 		backend: &http.Client{
 			Transport: tr,
 			Timeout:   cfg.BackendTimeout,
@@ -506,8 +474,13 @@ func (g *Guard) acquireRequest() bool {
 	}
 }
 
-func (g *Guard) releaseRequest() {
+func (g *Guard) releaseGlobalRequest() {
 	g.activeReq.Add(-1)
+}
+
+func (g *Guard) releaseRequest(client string) {
+	g.releaseGlobalRequest()
+	g.states.releaseRequest(client)
 }
 
 func (g *Guard) admitGlobal() bool {
@@ -526,9 +499,9 @@ func (g *Guard) releaseGlobal() {
 	g.globalCon.Add(-1)
 }
 
-// canonicalIPKey returns the rate-limit identity for an address: IPv4 (and
+// canonicalIPKey returns the per-client concurrency identity: IPv4 (and
 // IPv4-mapped IPv6) addresses individually, IPv6 addresses by their /64 so a
-// single subscriber cannot mint unlimited identities from one delegated prefix.
+// subscriber using privacy addresses in one delegated prefix shares one slot pool.
 func canonicalIPKey(ip net.IP) string {
 	if v4 := ip.To4(); v4 != nil {
 		return v4.String()
@@ -652,7 +625,7 @@ func (l *guardedListener) Accept() (net.Conn, error) {
 		if trusted {
 			maxConns = int32(min(l.guard.cfg.MaxGlobalConns, maxInt32))
 		}
-		if !l.guard.states.admitConn(source, maxConns, time.Now(), l.guard.cfg.Burst) {
+		if !l.guard.states.admitConn(source, maxConns, time.Now()) {
 			_ = conn.Close()
 			l.guard.releaseGlobal()
 			continue
@@ -677,6 +650,9 @@ func (g *Guard) Handler() http.Handler {
 		if !ok || state == nil {
 			return
 		}
+		if r.Context().Err() != nil {
+			return
+		}
 		if !state.nextQuery(g.cfg.MaxQueriesPerConn) {
 			g.reject(w, state, http.StatusTooManyRequests)
 			return
@@ -690,19 +666,16 @@ func (g *Guard) Handler() http.Handler {
 			}
 		}
 		now := time.Now()
-		if !g.globalRate.allow(now) {
-			g.reject(w, state, http.StatusTooManyRequests)
-			return
-		}
-		if !g.states.allow(client, now, g.cfg.Rate, g.cfg.Burst) {
-			g.reject(w, state, http.StatusTooManyRequests)
-			return
-		}
 		if !g.acquireRequest() {
 			g.reject(w, state, http.StatusTooManyRequests)
 			return
 		}
-		defer g.releaseRequest()
+		if !g.states.admitRequest(client, g.cfg.MaxConcurrentReqsPerIP, now) {
+			g.releaseGlobalRequest()
+			g.reject(w, state, http.StatusTooManyRequests)
+			return
+		}
+		defer g.releaseRequest(client)
 
 		if r.URL.Path != g.cfg.DOHPath || (r.Method != http.MethodGet && r.Method != http.MethodPost) {
 			// Answer platform health/readiness probes (e.g. SnapDeploy's wake
@@ -793,6 +766,10 @@ func (g *Guard) Handler() http.Handler {
 				w.Header().Add(k, value)
 			}
 		}
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			w.Header().Set("Content-Type", "application/dns-message")
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(len(responseBody)))
 		if state.lastQuery(g.cfg.MaxQueriesPerConn) {
 			// Serve the final allowed query, then close, so the peer reconnects
 			// instead of seeing a dropped request.
@@ -804,7 +781,7 @@ func (g *Guard) Handler() http.Handler {
 }
 
 func responseHopByHopHeaders(headers http.Header) map[string]struct{} {
-	hopByHop := make(map[string]struct{}, 8)
+	hopByHop := make(map[string]struct{}, 9)
 	for _, name := range []string{
 		"connection",
 		"keep-alive",
@@ -814,6 +791,7 @@ func responseHopByHopHeaders(headers http.Header) map[string]struct{} {
 		"trailer",
 		"transfer-encoding",
 		"upgrade",
+		"content-length", // buffered response body gets a fresh exact length
 	} {
 		hopByHop[http.CanonicalHeaderKey(name)] = struct{}{}
 	}
@@ -949,7 +927,7 @@ func skipDNSName(message []byte, offset int) (int, bool) {
 }
 
 // reject refuses a request. Direct clients are silently disconnected for
-// policy/rate/validation rejections, while backend failures are explicit 502s
+// policy/concurrency/validation rejections, while backend failures are explicit 502s
 // so strict DoH clients can retry or report the lookup failure.
 func (g *Guard) reject(w http.ResponseWriter, state *trackedConn, status int) {
 	if status == http.StatusBadGateway {
@@ -963,20 +941,19 @@ func (g *Guard) reject(w http.ResponseWriter, state *trackedConn, status int) {
 		w.WriteHeader(status)
 		return
 	}
-	g.dropHTTP(w)
+	g.dropHTTP(w, status)
 }
 
-func (g *Guard) dropHTTP(w http.ResponseWriter) {
+func (g *Guard) dropHTTP(w http.ResponseWriter, status int) {
 	if hj, ok := w.(http.Hijacker); ok {
 		if conn, _, err := hj.Hijack(); err == nil {
 			_ = conn.Close()
 		}
 		return
 	}
-	// HTTP/2 has no Hijacker. The deployment uses the HTTP listener behind the
-	// platform proxy, so this is only a defensive fallback for non-HTTP/1 paths.
-	w.Header().Set("Connection", "close")
-	w.WriteHeader(http.StatusTooManyRequests)
+	// HTTP/2 has no Hijacker; returning the status lets the stream terminate
+	// normally without emitting HTTP/1 hop-by-hop headers.
+	w.WriteHeader(status)
 }
 
 type connStateKey struct{}

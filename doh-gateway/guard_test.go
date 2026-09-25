@@ -3,7 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
-	"math"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +13,25 @@ import (
 	"testing"
 	"time"
 )
+
+type captureWriter struct {
+	header http.Header
+	status int
+	body   bytes.Buffer
+}
+
+func newCaptureWriter() *captureWriter {
+	return &captureWriter{header: make(http.Header)}
+}
+
+func (w *captureWriter) Header() http.Header    { return w.header }
+func (w *captureWriter) WriteHeader(status int) { w.status = status }
+func (w *captureWriter) Write(p []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	return w.body.Write(p)
+}
 
 func testDNSResponse() []byte {
 	return []byte{
@@ -47,120 +66,39 @@ func TestSourceTableIsBounded(t *testing.T) {
 	now := time.Now()
 	for i := 0; i < 1000; i++ {
 		key := "192.0.2." + strconv.Itoa(i%250)
-		_ = table.allow(key, now.Add(time.Duration(i)*time.Millisecond), 10, 20)
+		_ = table.admitRequest(key, 2, now.Add(time.Duration(i)*time.Millisecond))
+		table.releaseRequest(key)
 	}
 	if got := table.stateCount(); got > 128 {
 		t.Fatalf("state table exceeded bound: got %d", got)
 	}
 }
 
-func TestDefaultGuardRateAndBurst(t *testing.T) {
+func TestDefaultResourceProfile(t *testing.T) {
 	cfg := defaultGuardConfig()
-	if cfg.Rate != defaultRate {
-		t.Fatalf("default rate = %v, want %v", cfg.Rate, defaultRate)
-	}
-	if cfg.Burst != defaultBurst {
-		t.Fatalf("default burst = %v, want %v", cfg.Burst, defaultBurst)
-	}
-	if cfg.Burst < cfg.Rate {
-		t.Fatalf("default burst = %v is below default rate = %v", cfg.Burst, cfg.Rate)
-	}
-}
-
-func TestDefaultStrictDoHProfile(t *testing.T) {
-	cfg := defaultGuardConfig()
-	if cfg.Rate != 12 || cfg.Burst != 200 {
-		t.Fatalf("DoH rate/burst = %v/%v, want 12/200", cfg.Rate, cfg.Burst)
-	}
-	if cfg.GlobalRate != 80 || cfg.GlobalBurst != 200 {
-		t.Fatalf("global rate/burst = %v/%v, want 80/200", cfg.GlobalRate, cfg.GlobalBurst)
-	}
 	if cfg.MaxPerIPConns != 32 {
 		t.Fatalf("per-IP connections = %d, want 32", cfg.MaxPerIPConns)
+	}
+	if cfg.MaxConcurrentReqs != 32 || cfg.MaxConcurrentReqsPerIP != 8 {
+		t.Fatalf("request concurrency = %d/%d, want 32/8", cfg.MaxConcurrentReqs, cfg.MaxConcurrentReqsPerIP)
 	}
 	if cfg.BackendTimeout != 6*time.Second {
 		t.Fatalf("server timeout = %s, want 6s", cfg.BackendTimeout)
 	}
 }
 
-func TestStrictDoHEnvironmentOverrides(t *testing.T) {
-	t.Setenv("DOH_RATE_LIMIT", "13")
-	t.Setenv("DOH_RATE_BURST", "201")
-	t.Setenv("GLOBAL_RATE_LIMIT", "81")
-	t.Setenv("GLOBAL_RATE_BURST", "202")
+func TestResourceEnvironmentOverrides(t *testing.T) {
 	t.Setenv("IP_CONN_LIMIT", "33")
+	t.Setenv("GUARD_MAX_CONCURRENT_REQS", "40")
+	t.Setenv("GUARD_MAX_CONCURRENT_REQS_PER_IP", "9")
 	t.Setenv("SERVER_TIMEOUT", "7")
 
 	cfg := loadGuardConfig()
-	if cfg.Rate != 13 || cfg.Burst != 201 || cfg.GlobalRate != 81 || cfg.GlobalBurst != 202 {
-		t.Fatalf("strict DoH env override mismatch: rate=%v/%v global=%v/%v", cfg.Rate, cfg.Burst, cfg.GlobalRate, cfg.GlobalBurst)
+	if cfg.MaxPerIPConns != 33 || cfg.MaxConcurrentReqs != 40 || cfg.MaxConcurrentReqsPerIP != 9 {
+		t.Fatalf("resource env override mismatch: ip=%d global=%d per-ip=%d", cfg.MaxPerIPConns, cfg.MaxConcurrentReqs, cfg.MaxConcurrentReqsPerIP)
 	}
-	if cfg.MaxPerIPConns != 33 || cfg.BackendTimeout != 7*time.Second {
-		t.Fatalf("strict DoH env connection/timeout mismatch: ip-conns=%d timeout=%s", cfg.MaxPerIPConns, cfg.BackendTimeout)
-	}
-}
-
-func TestGlobalRateLimit(t *testing.T) {
-	b := newTokenBucket(1, 2)
-	now := time.Now()
-	if !b.allow(now) || !b.allow(now) {
-		t.Fatal("global burst did not allow two immediate requests")
-	}
-	if b.allow(now) {
-		t.Fatal("global rate limiter allowed a request over burst")
-	}
-	if !b.allow(now.Add(time.Second)) {
-		t.Fatal("global rate limiter did not replenish at the configured rate")
-	}
-}
-
-func TestDefaultBurstAllowsBurstImmediateRequests(t *testing.T) {
-	cfg := defaultGuardConfig()
-	table := newSourceTable(64)
-	now := time.Unix(1000, 0)
-	key := "198.51.100.30"
-	burst := int(cfg.Burst)
-	for i := 0; i < burst; i++ {
-		if !table.allow(key, now, cfg.Rate, cfg.Burst) {
-			t.Fatalf("request %d of %d was rejected", i+1, burst)
-		}
-	}
-	if table.allow(key, now, cfg.Rate, cfg.Burst) {
-		t.Fatalf("request %d was accepted immediately; burst should be %d", burst+1, burst)
-	}
-}
-
-func TestTokenBucketRateAndBurst(t *testing.T) {
-	table := newSourceTable(64)
-	now := time.Now()
-	key := "198.51.100.7"
-	if !table.allow(key, now, 10, 2) {
-		t.Fatal("first token was rejected")
-	}
-	if !table.allow(key, now, 10, 2) {
-		t.Fatal("burst token was rejected")
-	}
-	if table.allow(key, now, 10, 2) {
-		t.Fatal("third immediate token should be rejected")
-	}
-	if !table.allow(key, now.Add(100*time.Millisecond), 10, 2) {
-		t.Fatal("refilled token was rejected")
-	}
-}
-
-func TestSourceRateBucketsArePerIP(t *testing.T) {
-	table := newSourceTable(64)
-	now := time.Unix(1000, 0)
-	key := "198.51.100.20"
-
-	if !table.allow(key, now, 1, 1) {
-		t.Fatal("first request was rejected")
-	}
-	if table.allow(key, now, 1, 1) {
-		t.Fatal("second immediate request should be rejected")
-	}
-	if !table.allow(key, now.Add(time.Second), 1, 1) {
-		t.Fatal("rate bucket did not refill for the same source IP")
+	if cfg.BackendTimeout != 7*time.Second {
+		t.Fatalf("server timeout = %s, want 7s", cfg.BackendTimeout)
 	}
 }
 
@@ -168,17 +106,17 @@ func TestPerIPConnectionLimit(t *testing.T) {
 	table := newSourceTable(64)
 	now := time.Now()
 	key := "203.0.113.9"
-	if !table.admitConn(key, 2, now, 20) {
+	if !table.admitConn(key, 2, now) {
 		t.Fatal("first connection rejected")
 	}
-	if !table.admitConn(key, 2, now, 20) {
+	if !table.admitConn(key, 2, now) {
 		t.Fatal("second connection rejected")
 	}
-	if table.admitConn(key, 2, now, 20) {
+	if table.admitConn(key, 2, now) {
 		t.Fatal("third connection should be rejected")
 	}
 	table.releaseConn(key)
-	if !table.admitConn(key, 2, now, 20) {
+	if !table.admitConn(key, 2, now) {
 		t.Fatal("connection should be admitted after release")
 	}
 }
@@ -193,7 +131,7 @@ func TestTrackedConnCloseReleasesCounters(t *testing.T) {
 	g := NewGuard(defaultGuardConfig())
 	server, client := net.Pipe()
 	defer client.Close()
-	ok := g.states.admitConn("192.0.2.55", g.cfg.MaxPerIPConns, time.Now(), g.cfg.Burst)
+	ok := g.states.admitConn("192.0.2.55", g.cfg.MaxPerIPConns, time.Now())
 	if !ok {
 		t.Fatal("connection admission failed")
 	}
@@ -259,6 +197,70 @@ func TestTrackedConnQueryCap(t *testing.T) {
 	}
 }
 
+func TestSourceTablePerClientConcurrencyIsBounded(t *testing.T) {
+	table := newSourceTable(64)
+	now := time.Now()
+	key := "203.0.113.10"
+	if !table.admitRequest(key, 2, now) || !table.admitRequest(key, 2, now) {
+		t.Fatal("request concurrency admission failed within limit")
+	}
+	if table.admitRequest(key, 2, now) {
+		t.Fatal("per-client concurrency limit was bypassed")
+	}
+	table.releaseRequest(key)
+	if !table.admitRequest(key, 2, now) {
+		t.Fatal("request slot was not released")
+	}
+}
+
+func TestSourceTableFailedRequestAdmissionDoesNotReleaseActiveSlot(t *testing.T) {
+	table := newSourceTable(64)
+	now := time.Now()
+	key := "203.0.113.11"
+	if !table.admitRequest(key, 2, now) || !table.admitRequest(key, 2, now) {
+		t.Fatal("request concurrency admission failed within limit")
+	}
+	if table.admitRequest(key, 2, now) {
+		t.Fatal("third request should be rejected")
+	}
+	shard := table.shard(key)
+	shard.mu.Lock()
+	got := shard.clients[key].requests
+	shard.mu.Unlock()
+	if got != 2 {
+		t.Fatalf("failed admission changed active request count: got %d, want 2", got)
+	}
+}
+
+func TestGlobalRequestConcurrencyIsBounded(t *testing.T) {
+	g := NewGuard(defaultGuardConfig())
+	g.cfg.MaxConcurrentReqs = 2
+	if !g.acquireRequest() || !g.acquireRequest() {
+		t.Fatal("request concurrency admission failed within limit")
+	}
+	if g.acquireRequest() {
+		t.Fatal("third request should be rejected at aggregate limit")
+	}
+	g.releaseGlobalRequest()
+	if !g.acquireRequest() {
+		t.Fatal("aggregate request slot was not released")
+	}
+	g.releaseGlobalRequest()
+	g.releaseGlobalRequest()
+}
+
+func TestNormalizeCapsRequestConcurrencyToPlatformInt(t *testing.T) {
+	maxPlatformInt := int64(^uint(0) >> 1)
+	if maxPlatformInt < int64(^uint32(0)) {
+		cfg := defaultGuardConfig()
+		cfg.MaxConcurrentReqs = maxPlatformInt + 1
+		cfg.normalize()
+		if cfg.MaxConcurrentReqs != defaultMaxRequests {
+			t.Fatalf("oversized platform-int request limit not rejected: got %d", cfg.MaxConcurrentReqs)
+		}
+	}
+}
+
 func TestGlobalConnectionAdmissionIsNonBlockingAtLimit(t *testing.T) {
 	g := NewGuard(defaultGuardConfig())
 	g.cfg.MaxGlobalConns = 1
@@ -287,7 +289,7 @@ func TestDoHProxySanitizesForwardedClientIP(t *testing.T) {
 	cfg := defaultGuardConfig()
 	cfg.BackendHTTP = strings.TrimPrefix(backend.URL, "http://")
 	g := NewGuard(cfg)
-	ok := g.states.admitConn("192.0.2.77", cfg.MaxPerIPConns, time.Now(), cfg.Burst)
+	ok := g.states.admitConn("192.0.2.77", cfg.MaxPerIPConns, time.Now())
 	if !ok {
 		t.Fatal("client state admission failed")
 	}
@@ -314,26 +316,26 @@ func TestDoHProxySanitizesForwardedClientIP(t *testing.T) {
 
 func TestNormalizeClampsUnsafeValues(t *testing.T) {
 	cfg := GuardConfig{
-		Rate:              -1,
-		Burst:             0,
-		MaxGlobalConns:    0,
-		MaxPerIPConns:     0,
-		MaxSourceStates:   0,
-		MaxDNSMessage:     0,
-		MaxQueriesPerConn: 0,
-		MaxConcurrentReqs: 0,
-		MaxHeaderBytes:    1,
-		MaxResponseBytes:  1,
+		MaxGlobalConns:         0,
+		MaxPerIPConns:          0,
+		MaxSourceStates:        0,
+		MaxDNSMessage:          0,
+		MaxQueriesPerConn:      0,
+		MaxConcurrentReqs:      0,
+		MaxConcurrentReqsPerIP: 0,
+		MaxHeaderBytes:         1,
+		MaxResponseBytes:       1,
 	}
 	cfg.normalize()
 	defaults := defaultGuardConfig()
 	for name, values := range map[string][2]int64{
-		"global":   {cfg.MaxGlobalConns, defaults.MaxGlobalConns},
-		"per-ip":   {int64(cfg.MaxPerIPConns), int64(defaults.MaxPerIPConns)},
-		"states":   {int64(cfg.MaxSourceStates), int64(defaults.MaxSourceStates)},
-		"dns-size": {int64(cfg.MaxDNSMessage), int64(defaults.MaxDNSMessage)},
-		"queries":  {int64(cfg.MaxQueriesPerConn), int64(defaults.MaxQueriesPerConn)},
-		"requests": {cfg.MaxConcurrentReqs, defaults.MaxConcurrentReqs},
+		"global":          {cfg.MaxGlobalConns, defaults.MaxGlobalConns},
+		"per-ip":          {int64(cfg.MaxPerIPConns), int64(defaults.MaxPerIPConns)},
+		"states":          {int64(cfg.MaxSourceStates), int64(defaults.MaxSourceStates)},
+		"dns-size":        {int64(cfg.MaxDNSMessage), int64(defaults.MaxDNSMessage)},
+		"queries":         {int64(cfg.MaxQueriesPerConn), int64(defaults.MaxQueriesPerConn)},
+		"requests":        {cfg.MaxConcurrentReqs, defaults.MaxConcurrentReqs},
+		"requests-per-ip": {int64(cfg.MaxConcurrentReqsPerIP), int64(defaults.MaxConcurrentReqsPerIP)},
 	} {
 		if values[0] != values[1] {
 			t.Fatalf("%s: got %d, want %d", name, values[0], values[1])
@@ -344,30 +346,6 @@ func TestNormalizeClampsUnsafeValues(t *testing.T) {
 	}
 	if cfg.MaxResponseBytes != defaults.MaxResponseBytes {
 		t.Fatalf("response bytes: got %d, want %d", cfg.MaxResponseBytes, defaults.MaxResponseBytes)
-	}
-}
-
-func TestNormalizeRejectsNonFiniteRateValues(t *testing.T) {
-	cfg := defaultGuardConfig()
-	cfg.Rate = math.NaN()
-	cfg.Burst = math.Inf(1)
-	cfg.normalize()
-	if cfg.Rate != defaultRate {
-		t.Fatalf("rate: got %v, want %v", cfg.Rate, defaultRate)
-	}
-	if cfg.Burst != defaultBurst {
-		t.Fatalf("burst: got %v, want %v", cfg.Burst, defaultBurst)
-	}
-
-	cfg = defaultGuardConfig()
-	cfg.Rate = math.Inf(1)
-	cfg.Burst = 1
-	cfg.normalize()
-	if cfg.Rate != defaultRate {
-		t.Fatalf("infinite rate: got %v, want %v", cfg.Rate, defaultRate)
-	}
-	if cfg.Burst != defaultRate {
-		t.Fatalf("burst below normalized rate: got %v, want %v", cfg.Burst, defaultRate)
 	}
 }
 
@@ -383,54 +361,42 @@ func TestEnvUint32RejectsOverflowAndNegative(t *testing.T) {
 	}
 
 	t.Setenv("GUARD_MAX_QUERIES_PER_CONN", "4294967295")
-	if got := envUint32("GUARD_MAX_QUERIES_PER_CONN", 50); got != math.MaxUint32 {
+	if got := envUint32("GUARD_MAX_QUERIES_PER_CONN", 50); got != ^uint32(0) {
 		t.Fatalf("maximum uint32 env rejected: got %d", got)
 	}
 }
 
-func TestDoHRateLimitCannotBeFragmentedByHost(t *testing.T) {
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/dns-message")
-		_, _ = w.Write(testDNSResponse())
-	}))
-	defer backend.Close()
-
-	cfg := defaultGuardConfig()
-	cfg.Rate = 1
-	cfg.Burst = 1
-	cfg.BackendHTTP = strings.TrimPrefix(backend.URL, "http://")
-	g := NewGuard(cfg)
-	ok := g.states.admitConn("192.0.2.76", cfg.MaxPerIPConns, time.Now(), cfg.Burst)
-	if !ok {
-		t.Fatal("client state admission failed")
-	}
-	if !g.admitGlobal() {
-		t.Fatal("global connection admission failed")
-	}
-	defer func() {
-		g.states.releaseConn("192.0.2.76")
-		g.releaseGlobal()
-	}()
-
-	newRequest := func(host string) *http.Request {
-		req, err := http.NewRequest(http.MethodGet, "http://guard/dns-query?dns=AAE", nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		req.Host = host
-		return req.WithContext(context.WithValue(req.Context(), connStateKey{}, &trackedConn{source: "192.0.2.76", guard: g}))
+func TestEnvInt32RejectsOverflowAndNegative(t *testing.T) {
+	t.Setenv("IP_CONN_LIMIT", "2147483648")
+	if got := envInt32("IP_CONN_LIMIT", 50); got != 50 {
+		t.Fatalf("overflowing int32 env accepted: got %d", got)
 	}
 
-	w := httptest.NewRecorder()
-	g.Handler().ServeHTTP(w, newRequest("one.example"))
-	if w.Code != http.StatusOK {
-		t.Fatalf("first request status: %d", w.Code)
+	t.Setenv("IP_CONN_LIMIT", "-1")
+	if got := envInt32("IP_CONN_LIMIT", 50); got != 50 {
+		t.Fatalf("negative int32 env accepted: got %d", got)
 	}
 
-	w = httptest.NewRecorder()
-	g.Handler().ServeHTTP(w, newRequest("two.example"))
-	if w.Code != http.StatusTooManyRequests {
-		t.Fatalf("second request with another Host bypassed rate limit: status=%d", w.Code)
+	t.Setenv("IP_CONN_LIMIT", "2147483647")
+	if got := envInt32("IP_CONN_LIMIT", 50); got != 2147483647 {
+		t.Fatalf("maximum int32 env rejected: got %d", got)
+	}
+}
+
+func TestClientIPHeaderCanBeExplicitlyDisabled(t *testing.T) {
+	t.Setenv("GUARD_CLIENT_IP_HEADER", "")
+	cfg := loadGuardConfig()
+	if cfg.ClientIPHeader != "" {
+		t.Fatalf("empty forwarded-client header env did not disable header: %q", cfg.ClientIPHeader)
+	}
+}
+
+func TestDropHTTPPreservesStatusWithoutHijacker(t *testing.T) {
+	g := NewGuard(defaultGuardConfig())
+	w := newCaptureWriter()
+	g.dropHTTP(w, http.StatusServiceUnavailable)
+	if w.status != http.StatusServiceUnavailable {
+		t.Fatalf("HTTP/2 rejection status = %d, want %d", w.status, http.StatusServiceUnavailable)
 	}
 }
 
@@ -455,7 +421,7 @@ func TestDoHProxyNormalizesGETQueryAndBackendHost(t *testing.T) {
 	cfg := defaultGuardConfig()
 	cfg.BackendHTTP = strings.TrimPrefix(backend.URL, "http://")
 	g := NewGuard(cfg)
-	ok := g.states.admitConn("192.0.2.77", cfg.MaxPerIPConns, time.Now(), cfg.Burst)
+	ok := g.states.admitConn("192.0.2.77", cfg.MaxPerIPConns, time.Now())
 	if !ok {
 		t.Fatal("client state admission failed")
 	}
@@ -497,7 +463,7 @@ func TestDoHProxyDoesNotFollowBackendRedirects(t *testing.T) {
 	cfg := defaultGuardConfig()
 	cfg.BackendHTTP = strings.TrimPrefix(backend.URL, "http://")
 	g := NewGuard(cfg)
-	ok := g.states.admitConn("192.0.2.78", cfg.MaxPerIPConns, time.Now(), cfg.Burst)
+	ok := g.states.admitConn("192.0.2.78", cfg.MaxPerIPConns, time.Now())
 	if !ok {
 		t.Fatal("client state admission failed")
 	}
@@ -536,7 +502,7 @@ func TestDoHProxyRejectsOversizedBackendResponseHeaders(t *testing.T) {
 	cfg.MaxHeaderBytes = 16 << 10
 	cfg.BackendHTTP = strings.TrimPrefix(backend.URL, "http://")
 	g := NewGuard(cfg)
-	ok := g.states.admitConn("192.0.2.79", cfg.MaxPerIPConns, time.Now(), cfg.Burst)
+	ok := g.states.admitConn("192.0.2.79", cfg.MaxPerIPConns, time.Now())
 	if !ok {
 		t.Fatal("client state admission failed")
 	}
@@ -560,6 +526,45 @@ func TestDoHProxyRejectsOversizedBackendResponseHeaders(t *testing.T) {
 	}
 }
 
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestDoHProxyNormalizesSuccessfulResponseHeaders(t *testing.T) {
+	cfg := defaultGuardConfig()
+	cfg.BackendHTTP = "127.0.0.1:4002"
+	g := NewGuard(cfg)
+	g.backend = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header: http.Header{
+				"Content-Type":   []string{"text/plain"},
+				"Content-Length": []string{"1"},
+			},
+			Body:          io.NopCloser(bytes.NewReader(testDNSResponse())),
+			ContentLength: -1,
+			Request:       r,
+		}, nil
+	})}
+	state := &trackedConn{source: "192.0.2.88", guard: g}
+	req, err := http.NewRequest(http.MethodGet, "http://guard/dns-query?dns=AAE", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req = req.WithContext(context.WithValue(req.Context(), connStateKey{}, state))
+	w := newCaptureWriter()
+	g.Handler().ServeHTTP(w, req)
+	if w.status != http.StatusOK {
+		t.Fatalf("unexpected status: %d", w.status)
+	}
+	if got := w.Header().Get("Content-Type"); got != "application/dns-message" {
+		t.Fatalf("content type = %q", got)
+	}
+	if got := w.Header().Get("Content-Length"); got != strconv.Itoa(w.body.Len()) {
+		t.Fatalf("content length = %q, want %d", got, w.body.Len())
+	}
+}
+
 func TestDoHProxyRejectsUnknownLengthOversizedBackendResponse(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/dns-message")
@@ -572,7 +577,7 @@ func TestDoHProxyRejectsUnknownLengthOversizedBackendResponse(t *testing.T) {
 	cfg.MaxResponseBytes = 512
 	cfg.BackendHTTP = strings.TrimPrefix(backend.URL, "http://")
 	g := NewGuard(cfg)
-	ok := g.states.admitConn("192.0.2.82", cfg.MaxPerIPConns, time.Now(), cfg.Burst)
+	ok := g.states.admitConn("192.0.2.82", cfg.MaxPerIPConns, time.Now())
 	if !ok {
 		t.Fatal("client state admission failed")
 	}
@@ -657,7 +662,7 @@ func TestDoHProxyDoesNotForwardStandardHopByHopHeaders(t *testing.T) {
 	cfg := defaultGuardConfig()
 	cfg.BackendHTTP = strings.TrimPrefix(backend.URL, "http://")
 	g := NewGuard(cfg)
-	ok := g.states.admitConn("192.0.2.81", cfg.MaxPerIPConns, time.Now(), cfg.Burst)
+	ok := g.states.admitConn("192.0.2.81", cfg.MaxPerIPConns, time.Now())
 	if !ok {
 		t.Fatal("client state admission failed")
 	}
@@ -711,7 +716,7 @@ func TestDoHProxyDoesNotForwardConnectionNominatedHeaders(t *testing.T) {
 	cfg := defaultGuardConfig()
 	cfg.BackendHTTP = strings.TrimPrefix(backend.URL, "http://")
 	g := NewGuard(cfg)
-	ok := g.states.admitConn("192.0.2.80", cfg.MaxPerIPConns, time.Now(), cfg.Burst)
+	ok := g.states.admitConn("192.0.2.80", cfg.MaxPerIPConns, time.Now())
 	if !ok {
 		t.Fatal("client state admission failed")
 	}
@@ -800,47 +805,6 @@ func TestClientIPFromHeaderIgnoresClientInjectedValues(t *testing.T) {
 	}
 }
 
-func TestTrustedProxyRateLimitsByForwardedClient(t *testing.T) {
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if got := r.Header.Get("X-Forwarded-For"); got != "203.0.113.50" && got != "203.0.113.51" {
-			t.Errorf("backend saw client %q", got)
-		}
-		w.Header().Set("Content-Type", "application/dns-message")
-		_, _ = w.Write(testDNSResponse())
-	}))
-	defer backend.Close()
-
-	cfg := defaultGuardConfig()
-	cfg.Rate = 1
-	cfg.Burst = 1
-	cfg.ClientIPHeader = "X-Forwarded-For"
-	cfg.BackendHTTP = strings.TrimPrefix(backend.URL, "http://")
-	g := NewGuard(cfg)
-	conn := &trackedConn{source: "10.0.0.2", guard: g, trusted: true}
-
-	serve := func(client string) int {
-		req, err := http.NewRequest(http.MethodGet, "http://guard/dns-query?dns=AAE", nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		req.Header.Set("X-Forwarded-For", client)
-		req = req.WithContext(context.WithValue(req.Context(), connStateKey{}, conn))
-		w := httptest.NewRecorder()
-		g.Handler().ServeHTTP(w, req)
-		return w.Code
-	}
-
-	if got := serve("203.0.113.50"); got != http.StatusOK {
-		t.Fatalf("first client status: %d", got)
-	}
-	if got := serve("203.0.113.50"); got != http.StatusTooManyRequests {
-		t.Fatalf("same client over its limit got status %d", got)
-	}
-	if got := serve("203.0.113.51"); got != http.StatusOK {
-		t.Fatalf("a different client behind the same proxy was throttled: %d", got)
-	}
-}
-
 func TestLastQueryClosesConnectionGracefully(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/dns-message")
@@ -889,7 +853,7 @@ func TestClientDisconnectIsNotConvertedTo502(t *testing.T) {
 	cfg.BackendHTTP = strings.TrimPrefix(backend.URL, "http://")
 	g := NewGuard(cfg)
 	const source = "192.0.2.91"
-	if !g.states.admitConn(source, cfg.MaxPerIPConns, time.Now(), cfg.Burst) || !g.admitGlobal() {
+	if !g.states.admitConn(source, cfg.MaxPerIPConns, time.Now()) || !g.admitGlobal() {
 		t.Fatal("request admission failed")
 	}
 	defer func() {
@@ -928,7 +892,7 @@ func TestBackendTimeoutReturns502(t *testing.T) {
 	cfg.BackendHTTP = strings.TrimPrefix(backend.URL, "http://")
 	g := NewGuard(cfg)
 	const source = "192.0.2.92"
-	if !g.states.admitConn(source, cfg.MaxPerIPConns, time.Now(), cfg.Burst) || !g.admitGlobal() {
+	if !g.states.admitConn(source, cfg.MaxPerIPConns, time.Now()) || !g.admitGlobal() {
 		t.Fatal("request admission failed")
 	}
 	defer func() {
@@ -959,7 +923,7 @@ func TestInvalidBackendDNSResponseReturns502(t *testing.T) {
 	cfg.BackendHTTP = strings.TrimPrefix(backend.URL, "http://")
 	g := NewGuard(cfg)
 	const source = "192.0.2.93"
-	if !g.states.admitConn(source, cfg.MaxPerIPConns, time.Now(), cfg.Burst) || !g.admitGlobal() {
+	if !g.states.admitConn(source, cfg.MaxPerIPConns, time.Now()) || !g.admitGlobal() {
 		t.Fatal("request admission failed")
 	}
 	defer func() {
