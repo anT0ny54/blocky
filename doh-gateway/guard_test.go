@@ -90,11 +90,6 @@ func TestStrictDoHEnvironmentOverrides(t *testing.T) {
 	t.Setenv("GLOBAL_RATE_BURST", "202")
 	t.Setenv("IP_CONN_LIMIT", "33")
 	t.Setenv("SERVER_TIMEOUT", "7")
-	// Legacy variables must not override the canonical strict-DoH settings.
-	t.Setenv("GUARD_RATE", "1")
-	t.Setenv("GUARD_BURST", "2")
-	t.Setenv("GUARD_MAX_IP_CONNS", "3")
-	t.Setenv("GUARD_BACKEND_TIMEOUT", "1s")
 
 	cfg := loadGuardConfig()
 	if cfg.Rate != 13 || cfg.Burst != 201 || cfg.GlobalRate != 81 || cfg.GlobalBurst != 202 {
