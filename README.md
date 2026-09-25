@@ -52,8 +52,6 @@ Behind the SnapDeploy proxy every user connects from the proxy's internal addres
 | `caching.maxItemsCount` | `20000` | Bounded DNS cache entries |
 | `caching.prefetching` | `false` | Avoid extra upstream traffic |
 
-For compatibility with older deployments, `GUARD_RATE`, `GUARD_BURST`, `GUARD_MAX_IP_CONNS`, and `GUARD_BACKEND_TIMEOUT` remain accepted as fallback environment names; the strict-DoH names above take precedence.
-
 Refused requests are handled differently by peer type. A direct client is disconnected without a response for policy/rate/validation rejections. Backend failures (`502 Bad Gateway`) are explicit for both direct and proxied clients, so strict DoH clients can retry or report the lookup failure. The internal proxy receives normal status codes (`429` with `Retry-After`, `400`, `404`, or `502`) and keeps the connection.
 
 `GOMEMLIMIT` is a soft Go runtime heap target, not a hard container-memory cap. The combined 368 MiB heap targets leave headroom for stacks, native/runtime memory, buffers, the filesystem, and the container environment.
@@ -92,21 +90,25 @@ For ARM builds, BuildKit supplies the target architecture and variant and the gu
 
 ## Scope
 
-This repository is limited to the Blocky + DoH gateway deployment. The list below is informational and is not part of the runtime configuration.
+This repository is limited to the Blocky + DoH gateway deployment.
 
-## Public endpoints
+## License
 
-High-performance DNS using HaGeZi Multi Pro + TIF blocklists.
+See [`LICENSE`](LICENSE).
+
+## 🌐 Free DNS Services
+
+High-performance DNS utilizing HaGeZi Blocklists (Multi Pro + TIF).
 
 | Blocklist | DNS-over-HTTPS (DoH) |
 | :--- | :--- |
 | Multi Pro + TIF | `https://freedns.koyeb.app/dns-query` (Recommended) |
 | Multi Pro + TIF | `https://dns-pi.vercel.app/api/doh/dns-query` (Recommended) |
 | Multi Pro + TIF | `https://dnssix.netlify.app/api/doh/dns-query` |
-| Multi Pro + TIF | `https://dns-93aca.containers.snapdeploy.app/dns-query` (Recommended; sleeps after 15 minutes idle) |
-| Multi Pro + TIF | `https://doh-93aca.containers.snapdeploy.app/dns-query` (Recommended; sleeps after 15 minutes idle) |
+| Multi Pro + TIF | `https://dns-93aca.containers.snapdeploy.app/dns-query` (Recommended, but will sleep if not used in 15 minutes) |
+| Multi Pro + TIF | `https://doh-93aca.containers.snapdeploy.app/dns-query` (Recommended, but will sleep if not used in 15 minutes) |
 
-# ⚡ Bandwidth Hero Server
+## ⚡ Bandwidth Hero Server
 
 A lightweight image optimization proxy designed to slash bandwidth usage and accelerate web browsing.
 
@@ -114,6 +116,8 @@ Bandwidth Hero Server fetches remote images, compresses them on the fly, and del
 
 🖥️ **Live Demo:** [Bandwidth Hero](https://bhserv.netlify.app/).
 
-## License
+## Supporting the Project
 
-See [`LICENSE`](LICENSE).
+If you find this project useful, donations are appreciated:
+
+- **Bitcoin**: `1HntwKxyqGCfnSGvGLMUTRAqLnTvLarAQP`
