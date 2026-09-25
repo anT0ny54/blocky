@@ -10,9 +10,19 @@ upstreams:
   strategy: random
   timeout: 2s
 
+# Bootstrap the three configured DoH upstreams over HTTPS to their published
+# fixed IPv4 addresses. This avoids /etc/resolv.conf and any unrelated plaintext
+# DNS resolver for upstream hostname lookup.
 bootstrapDns:
-  - tcp+udp:1.1.1.1
-  - tcp+udp:8.8.8.8
+  - upstream: https://root.hagezi.org/dns-query
+    ips:
+      - 188.34.161.210
+  - upstream: https://wurzn.hagezi.org/dns-query
+    ips:
+      - 159.69.155.94
+  - upstream: https://juuri.hagezi.org/dns-query
+    ips:
+      - 95.217.163.17
 
 # The Go abuse guard owns the public HTTP listener on 4001 and forwards DoH to
 # Blocky over loopback on 4002. Keep DNS available on loopback solely for Blocky's
@@ -39,7 +49,7 @@ caching:
 # Blocky keeps its optional resolver-chain limiter at the v0.35.0 default (off).
 
 log:
-  level: info
+  level: warn
 
 # Query logging is intentionally disabled.
 queryLog:
