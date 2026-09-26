@@ -7,8 +7,9 @@ upstreams:
       - https://wurzn.hagezi.org/dns-query
       - https://juuri.hagezi.org/dns-query
 
+  # SERVER_TIMEOUT: Blocky's external-upstream query deadline.
   strategy: random
-  timeout: 2s
+  timeout: 6s
 
 # Bootstrap the three configured DoH upstreams over HTTPS to their published
 # fixed IPv4 addresses. This avoids /etc/resolv.conf and any unrelated plaintext
@@ -38,15 +39,17 @@ connectIPVersion: v4
 caching:
   minTime: 5m
   maxTime: 1h
-  # Bounded cache: ~20k entries is a few tens of MB, well inside Blocky's
-  # 320 MiB heap target, and cannot grow with attacker-controlled input.
-  maxItemsCount: 20000
+  # Bounded cache for the 512 MB profile. Blocky's maxItemsCount is a soft
+  # entry-count limit; Blocky v0.35.0 has no per-entry byte-size knob.
+  maxItemsCount: 8192
   # Prefetching improves latency but causes extra upstream traffic and memory use.
   prefetching: false
   cacheTimeNegative: 30m
 
 # Public DoH abuse protection is enforced by /app/guard before Blocky.
-# Blocky keeps its optional resolver-chain limiter at the v0.35.0 default (off).
+# There is intentionally no request-rate token bucket or resolver-chain rate limiter.
+# Resource protection is bounded by accepted connections, source-IP concurrency,
+# request size, backend connection count, timeouts, and DNS response validation.
 
 log:
   level: warn

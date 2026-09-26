@@ -21,26 +21,29 @@ COPY config.yml /app/config.yml
 COPY --from=guard-build /guard /app/guard
 
 # Tuned for SnapDeploy's 512 MB RAM / 0.25 vCPU instance. The two heap targets
-# (48 + 320 MiB) are soft limits that leave ~140 MiB of the 512 MB for stacks,
-# native memory, buffers and the container itself.
-#   IP_CONN_LIMIT                          per-public-source connection cap
-#   SERVER_TIMEOUT                         backend query deadline
-#   GUARD_CLIENT_IP_HEADER                 forwarding header honoured only when
-#                                         the TCP peer is private/loopback/CGNAT
-#                                         (the platform proxy); public peers
-#                                         can never spoof it
-ENV IP_CONN_LIMIT=32 \
+# (64 + 288 MiB) are soft limits that leave roughly 160 MiB for stacks,
+# native/runtime memory, buffers and the container environment.
+# GLOBAL_CONN_LIMIT is enforced at accept time; IP_CONN_LIMIT follows the trusted
+# client identity extracted from the platform's forwarding header.
+# UPSTREAM_MAX_CONNS limits the guard -> Blocky loopback connection pool.
+# The deployment intentionally has no token-bucket request-rate limiter.
+ENV GLOBAL_CONN_LIMIT=128 \
+    IP_CONN_LIMIT=64 \
+    DOH_MAX_BODY_BYTES=4096 \
+    UPSTREAM_MAX_CONNS=4 \
     SERVER_TIMEOUT=6 \
+    GUARD_RESPONSE_TIMEOUT=8s \
     GUARD_CLIENT_IP_HEADER=X-Forwarded-For \
-    GUARD_MAX_GLOBAL_CONNS=512 \
-    GUARD_MAX_IP_STATES=16384 \
-    GUARD_MAX_CONCURRENT_REQS=32 \
-    GUARD_MAX_CONCURRENT_REQS_PER_IP=8 \
+    GUARD_MAX_IP_STATES=256 \
+    GUARD_MAX_CONCURRENT_REQS=8 \
+    GUARD_MAX_CONCURRENT_REQS_PER_IP=4 \
     GUARD_MAX_QUERIES_PER_CONN=1024 \
+    GUARD_HEALTH_PATH=/healthz \
+    GUARD_BACKEND_DIAL_TIMEOUT=1s \
     GUARD_IDLE_TIMEOUT=60s \
     GOMAXPROCS=1 \
-    GOMEMLIMIT=48MiB \
-    BLOCKY_GOMEMLIMIT=320MiB
+    GOMEMLIMIT=64MiB \
+    BLOCKY_GOMEMLIMIT=288MiB
 
 # SnapDeploy exposes only the guarded public DoH listener.
 EXPOSE 4001
