@@ -233,7 +233,7 @@ func envInt64(name string, fallback int64) int64 {
 		return fallback
 	}
 	n, err := strconv.ParseInt(v, 10, 64)
-	if err != nil {
+	if err != nil || n < 0 {
 		return fallback
 	}
 	return n
@@ -1053,12 +1053,13 @@ func (g *Guard) Run(ctx context.Context) error {
 }
 
 func runHealthcheck() error {
-	conn, err := net.DialTimeout("udp", "127.0.0.1:5300", defaultBackendDial)
+	dialTimeout := envDuration("GUARD_BACKEND_DIAL_TIMEOUT", defaultBackendDial)
+	conn, err := net.DialTimeout("udp", "127.0.0.1:5300", dialTimeout)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(defaultBackendDial))
+	_ = conn.SetDeadline(time.Now().Add(dialTimeout))
 	query := []byte{
 		0x12, 0x34, 0x01, 0x00,
 		0x00, 0x01, 0x00, 0x00,
