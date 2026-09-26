@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -76,8 +77,8 @@ func TestSourceTableIsBounded(t *testing.T) {
 
 func TestDefaultResourceProfile(t *testing.T) {
 	cfg := defaultGuardConfig()
-	if cfg.MaxGlobalConns != 128 {
-		t.Fatalf("global connections = %d, want 128", cfg.MaxGlobalConns)
+	if cfg.MaxGlobalConns != 256 {
+		t.Fatalf("global connections = %d, want 256", cfg.MaxGlobalConns)
 	}
 	if cfg.MaxPerIPConns != 64 {
 		t.Fatalf("per-IP connections = %d, want 64", cfg.MaxPerIPConns)
@@ -85,14 +86,14 @@ func TestDefaultResourceProfile(t *testing.T) {
 	if cfg.MaxDNSMessage != 4096 {
 		t.Fatalf("DoH body size = %d, want 4096", cfg.MaxDNSMessage)
 	}
-	if cfg.MaxUpstreamConns != 4 {
-		t.Fatalf("upstream connections = %d, want 4", cfg.MaxUpstreamConns)
+	if cfg.MaxUpstreamConns != 8 {
+		t.Fatalf("upstream connections = %d, want 8", cfg.MaxUpstreamConns)
 	}
-	if cfg.MaxConcurrentReqs != 8 || cfg.MaxConcurrentReqsPerIP != 4 {
-		t.Fatalf("request concurrency = %d/%d, want 8/4", cfg.MaxConcurrentReqs, cfg.MaxConcurrentReqsPerIP)
+	if cfg.MaxConcurrentReqs != 16 || cfg.MaxConcurrentReqsPerIP != 8 {
+		t.Fatalf("request concurrency = %d/%d, want 16/8", cfg.MaxConcurrentReqs, cfg.MaxConcurrentReqsPerIP)
 	}
-	if cfg.MaxSourceStates != 256 {
-		t.Fatalf("source states = %d, want 256", cfg.MaxSourceStates)
+	if cfg.MaxSourceStates != 512 {
+		t.Fatalf("source states = %d, want 512", cfg.MaxSourceStates)
 	}
 	if cfg.BackendTimeout != 8*time.Second {
 		t.Fatalf("guard response timeout = %s, want 8s", cfg.BackendTimeout)
@@ -126,23 +127,25 @@ func TestLegacyGuardEnvironmentNamesStillWork(t *testing.T) {
 	}
 }
 
-func TestPerIPConnectionLimit(t *testing.T) {
-	table := newSourceTable(64)
+func TestPerIPConnectionLimit64(t *testing.T) {
+	table := newSourceTable(128)
 	now := time.Now()
 	key := "203.0.113.9"
-	if !table.admitConn(key, 2, now) {
-		t.Fatal("first connection rejected")
+	for i := 0; i < 64; i++ {
+		if !table.admitConn(key, 64, now) {
+			t.Fatalf("connection %d rejected below the 64-connection per-IP limit", i+1)
+		}
 	}
-	if !table.admitConn(key, 2, now) {
-		t.Fatal("second connection rejected")
+	if table.admitConn(key, 64, now) {
+		t.Fatal("65th connection should be rejected")
 	}
-	if table.admitConn(key, 2, now) {
-		t.Fatal("third connection should be rejected")
+	for i := 0; i < 64; i++ {
+		table.releaseConn(key)
 	}
-	table.releaseConn(key)
-	if !table.admitConn(key, 2, now) {
+	if !table.admitConn(key, 64, now) {
 		t.Fatal("connection should be admitted after release")
 	}
+	table.releaseConn(key)
 }
 
 func TestSourceKeyCanonicalizesIPv4MappedIPv6(t *testing.T) {
@@ -311,6 +314,64 @@ func TestNormalizeSourceStateCapFollowsGlobalConnections(t *testing.T) {
 	}
 }
 
+func TestSourceTableConcurrent64ConnectionsFromOneIP(t *testing.T) {
+	table := newSourceTable(512)
+	const limit = 64
+	const key = "203.0.113.64"
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	var admitted atomic.Int32
+	wg.Add(limit)
+	for i := 0; i < limit; i++ {
+		go func() {
+			defer wg.Done()
+			<-start
+			if table.admitConn(key, limit, time.Now()) {
+				admitted.Add(1)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	if got := admitted.Load(); got != limit {
+		t.Fatalf("concurrent admissions = %d, want %d", got, limit)
+	}
+	if table.admitConn(key, limit, time.Now()) {
+		t.Fatal("65th concurrent connection should be rejected")
+	}
+	for i := 0; i < limit; i++ {
+		table.releaseConn(key)
+	}
+}
+
+func TestSourceTableConcurrent128ConnectionsAcrossIPs(t *testing.T) {
+	table := newSourceTable(512)
+	const count = 128
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	var admitted atomic.Int32
+	wg.Add(count)
+	for i := 0; i < count; i++ {
+		key := "198.51.100." + strconv.Itoa(i%250)
+		go func(key string) {
+			defer wg.Done()
+			<-start
+			if table.admitConn(key, 64, time.Now()) {
+				admitted.Add(1)
+			}
+		}(key)
+	}
+	close(start)
+	wg.Wait()
+	if got := admitted.Load(); got != count {
+		t.Fatalf("concurrent multi-IP admissions = %d, want %d", got, count)
+	}
+	for i := 0; i < count; i++ {
+		key := "198.51.100." + strconv.Itoa(i%250)
+		table.releaseConn(key)
+	}
+}
+
 func TestBackendPoolUsesConfiguredConnectionCeiling(t *testing.T) {
 	cfg := defaultGuardConfig()
 	g := NewGuard(cfg)
@@ -318,8 +379,8 @@ func TestBackendPoolUsesConfiguredConnectionCeiling(t *testing.T) {
 	if !ok {
 		t.Fatal("backend transport is not *http.Transport")
 	}
-	if tr.MaxConnsPerHost != 4 || tr.MaxIdleConns != 4 || tr.MaxIdleConnsPerHost != 4 {
-		t.Fatalf("backend pool = max=%d idle=%d idle-host=%d, want 4/4/4", tr.MaxConnsPerHost, tr.MaxIdleConns, tr.MaxIdleConnsPerHost)
+	if tr.MaxConnsPerHost != 8 || tr.MaxIdleConns != 8 || tr.MaxIdleConnsPerHost != 8 {
+		t.Fatalf("backend pool = max=%d idle=%d idle-host=%d, want 8/8/8", tr.MaxConnsPerHost, tr.MaxIdleConns, tr.MaxIdleConnsPerHost)
 	}
 }
 
@@ -337,17 +398,21 @@ func TestNormalizeCapsRequestConcurrencyToPlatformInt(t *testing.T) {
 
 func TestGlobalConnectionAdmissionIsNonBlockingAtLimit(t *testing.T) {
 	g := NewGuard(defaultGuardConfig())
-	g.cfg.MaxGlobalConns = 1
-	if !g.admitGlobal() {
-		t.Fatal("first global connection rejected")
+	for i := int64(0); i < g.cfg.MaxGlobalConns; i++ {
+		if !g.admitGlobal() {
+			t.Fatalf("connection %d rejected below configured global limit", i+1)
+		}
 	}
 	if g.admitGlobal() {
-		t.Fatal("second global connection should be rejected immediately")
+		t.Fatal("connection over the configured global limit should be rejected immediately")
 	}
-	g.releaseGlobal()
+	for i := int64(0); i < g.cfg.MaxGlobalConns; i++ {
+		g.releaseGlobal()
+	}
 	if !g.admitGlobal() {
 		t.Fatal("global slot was not released")
 	}
+	g.releaseGlobal()
 }
 
 func TestHealthEndpointChecksBackendTCP(t *testing.T) {
@@ -434,6 +499,23 @@ func TestDoHProxySanitizesForwardedClientIP(t *testing.T) {
 	g.Handler().ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("unexpected status: %d", w.Code)
+	}
+}
+
+func TestEnvOverrideReplacesExistingValues(t *testing.T) {
+	env := []string{"PATH=/usr/bin", "GOMEMLIMIT=64MiB", "GOMEMLIMIT=96MiB", "LANG=C"}
+	got := envOverride(env, "GOMEMLIMIT", "288MiB")
+	count := 0
+	for _, item := range got {
+		if strings.HasPrefix(item, "GOMEMLIMIT=") {
+			count++
+			if item != "GOMEMLIMIT=288MiB" {
+				t.Fatalf("unexpected GOMEMLIMIT entry: %q", item)
+			}
+		}
+	}
+	if count != 1 {
+		t.Fatalf("GOMEMLIMIT entry count = %d, want 1", count)
 	}
 }
 
@@ -568,6 +650,40 @@ func TestDoHProxyNormalizesGETQueryAndBackendHost(t *testing.T) {
 	g.Handler().ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("unexpected status: %d", w.Code)
+	}
+}
+
+func TestDoHProxyAllows100SequentialRequestsWithoutApplicationRateLimiter(t *testing.T) {
+	calls := atomic.Int64{}
+	cfg := defaultGuardConfig()
+	g := NewGuard(cfg)
+	g.backend = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header: http.Header{
+				"Content-Type": []string{"application/dns-message"},
+			},
+			Body:          io.NopCloser(bytes.NewReader(testDNSResponse())),
+			ContentLength: int64(len(testDNSResponse())),
+			Request:       r,
+		}, nil
+	})}
+	state := &trackedConn{source: "203.0.113.100", guard: g}
+	for i := 0; i < 100; i++ {
+		req, err := http.NewRequest(http.MethodGet, "http://guard/dns-query?dns=AAE", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req = req.WithContext(context.WithValue(req.Context(), connStateKey{}, state))
+		w := httptest.NewRecorder()
+		g.Handler().ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("request %d status=%d, want 200", i+1, w.Code)
+		}
+	}
+	if got := calls.Load(); got != 100 {
+		t.Fatalf("backend calls = %d, want 100", got)
 	}
 }
 

@@ -28,9 +28,9 @@ const (
 	defaultBackendHTTP      = "127.0.0.1:4002"
 	defaultDohPath          = "/dns-query"
 	defaultHealthPath       = "/healthz"
-	defaultGlobalConns      = 128  // GLOBAL_CONN_LIMIT
+	defaultGlobalConns      = 256  // GLOBAL_CONN_LIMIT
 	defaultPerIPConns       = 64   // IP_CONN_LIMIT
-	defaultMaxSourceStates  = 256  // up to 2x the default global connection ceiling
+	defaultMaxSourceStates  = 512  // up to 2x the default global connection ceiling
 	defaultMaxDNSMessage    = 4096 // DOH_MAX_BODY_BYTES
 	defaultMaxQueriesConn   = 1024
 	defaultMaxHeaderBytes   = 16 << 10
@@ -42,12 +42,12 @@ const (
 	defaultIdleTimeout      = 60 * time.Second
 	defaultBackendTimeout   = 8 * time.Second // public guard response wait
 	defaultBackendDial      = 1 * time.Second
-	defaultMaxUpstreamConns = 4 // UPSTREAM_MAX_CONNS: guard -> Blocky loopback pool
-	defaultMaxRequests      = 8 // bounded in-flight work above the 4-connection backend pool
-	defaultMaxRequestsPerIP = 4
+	defaultMaxUpstreamConns = 8  // UPSTREAM_MAX_CONNS: guard -> Blocky loopback pool
+	defaultMaxRequests      = 16 // bounded in-flight work above the 8-connection backend pool
+	defaultMaxRequestsPerIP = 8
 	defaultBlockyMemLimit   = "288MiB"
 
-	stateShards = 64
+	stateShards = 16
 
 	// maxInt32 caps the per-source connection limit applied to platform-internal
 	// peers, which are bounded by the global connection cap instead.
@@ -1012,6 +1012,18 @@ func (g *Guard) dropHTTP(w http.ResponseWriter, status int) {
 
 type connStateKey struct{}
 
+func envOverride(env []string, name, value string) []string {
+	prefix := name + "="
+	out := env[:0]
+	for _, item := range env {
+		if strings.HasPrefix(item, prefix) {
+			continue
+		}
+		out = append(out, item)
+	}
+	return append(out, prefix+value)
+}
+
 func (g *Guard) Run(ctx context.Context) error {
 	listener, err := net.Listen("tcp", g.cfg.ListenAddr)
 	if err != nil {
@@ -1095,10 +1107,8 @@ func main() {
 	// Keep the public guard's small heap target separate from Blocky's resolver
 	// and cache heap. Both processes inherit the container environment, so give
 	// the child its own explicit bounded target.
-	blocky.Env = append(os.Environ(),
-		"GOMEMLIMIT="+envString("BLOCKY_GOMEMLIMIT", defaultBlockyMemLimit),
-		"GOMAXPROCS=1",
-	)
+	blocky.Env = envOverride(os.Environ(), "GOMEMLIMIT", envString("BLOCKY_GOMEMLIMIT", defaultBlockyMemLimit))
+	blocky.Env = envOverride(blocky.Env, "GOMAXPROCS", "1")
 	if err := blocky.Start(); err != nil {
 		fmt.Fprintln(os.Stderr, "start blocky:", err)
 		stop()
