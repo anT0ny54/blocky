@@ -7,7 +7,7 @@ upstreams:
       - https://wurzn.hagezi.org/dns-query
       - https://juuri.hagezi.org/dns-query
 
-  # SERVER_TIMEOUT: Blocky's external-upstream query deadline.
+  # Blocky's external-upstream query deadline (fixed here, not env-configurable).
   strategy: random
   timeout: 6s
 

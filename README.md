@@ -32,7 +32,7 @@ The public guard deliberately has **no token bucket or request-rate limiter**. A
 | `IP_CONN_LIMIT` | `64` | Per-source concurrent connection ceiling; shared clients behind one public IP share this pool |
 | `DOH_MAX_BODY_BYTES` | `4096` | Maximum decoded DoH DNS request size for GET/POST |
 | `UPSTREAM_MAX_CONNS` | `8` | Maximum simultaneous guard -> Blocky loopback connections |
-| `SERVER_TIMEOUT` | `6s` | Blocky external-upstream query deadline (`upstreams.timeout`) |
+| `upstreams.timeout` (config.yml) | `6s` | Blocky external-upstream query deadline; fixed in `config.yml`, not env-configurable |
 | `GUARD_RESPONSE_TIMEOUT` | `8s` | Maximum time the public guard waits for Blocky before returning `502` |
 | `GUARD_MAX_CONCURRENT_REQS` | `16` | Aggregate in-flight work ceiling; backend traffic is still bounded by 8 loopback connections |
 | `GUARD_MAX_CONCURRENT_REQS_PER_IP` | `8` | Per-client in-flight work ceiling |
