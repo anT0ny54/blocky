@@ -27,16 +27,16 @@ COPY --from=guard-build /guard /app/guard
 # client identity extracted from the platform's forwarding header.
 # UPSTREAM_MAX_CONNS limits the guard -> Blocky loopback connection pool.
 # The deployment intentionally has no token-bucket request-rate limiter.
-ENV GLOBAL_CONN_LIMIT=128 \
+ENV GLOBAL_CONN_LIMIT=256 \
     IP_CONN_LIMIT=64 \
     DOH_MAX_BODY_BYTES=4096 \
-    UPSTREAM_MAX_CONNS=4 \
+    UPSTREAM_MAX_CONNS=8 \
     SERVER_TIMEOUT=6 \
     GUARD_RESPONSE_TIMEOUT=8s \
     GUARD_CLIENT_IP_HEADER=X-Forwarded-For \
-    GUARD_MAX_IP_STATES=256 \
-    GUARD_MAX_CONCURRENT_REQS=8 \
-    GUARD_MAX_CONCURRENT_REQS_PER_IP=4 \
+    GUARD_MAX_IP_STATES=512 \
+    GUARD_MAX_CONCURRENT_REQS=16 \
+    GUARD_MAX_CONCURRENT_REQS_PER_IP=8 \
     GUARD_MAX_QUERIES_PER_CONN=1024 \
     GUARD_HEALTH_PATH=/healthz \
     GUARD_BACKEND_DIAL_TIMEOUT=1s \

@@ -28,15 +28,15 @@ The public guard deliberately has **no token bucket or request-rate limiter**. A
 
 | Setting | Default | Purpose |
 | :--- | ---: | :--- |
-| `GLOBAL_CONN_LIMIT` | `128` | Accept-time aggregate TCP connection ceiling |
+| `GLOBAL_CONN_LIMIT` | `256` | Accept-time aggregate TCP connection ceiling; enough headroom for many client IPs while request work remains bounded |
 | `IP_CONN_LIMIT` | `64` | Per-source concurrent connection ceiling; shared clients behind one public IP share this pool |
 | `DOH_MAX_BODY_BYTES` | `4096` | Maximum decoded DoH DNS request size for GET/POST |
-| `UPSTREAM_MAX_CONNS` | `4` | Maximum simultaneous guard -> Blocky loopback connections |
+| `UPSTREAM_MAX_CONNS` | `8` | Maximum simultaneous guard -> Blocky loopback connections |
 | `SERVER_TIMEOUT` | `6s` | Blocky external-upstream query deadline (`upstreams.timeout`) |
 | `GUARD_RESPONSE_TIMEOUT` | `8s` | Maximum time the public guard waits for Blocky before returning `502` |
-| `GUARD_MAX_CONCURRENT_REQS` | `8` | Small aggregate in-flight work ceiling for the 0.25 vCPU service |
-| `GUARD_MAX_CONCURRENT_REQS_PER_IP` | `4` | Per-client in-flight work ceiling |
-| `GUARD_MAX_IP_STATES` | `256` | Bounded source-state slots; normalized to at most 2× the global connection limit and 65,535 |
+| `GUARD_MAX_CONCURRENT_REQS` | `16` | Aggregate in-flight work ceiling; backend traffic is still bounded by 8 loopback connections |
+| `GUARD_MAX_CONCURRENT_REQS_PER_IP` | `8` | Per-client in-flight work ceiling |
+| `GUARD_MAX_IP_STATES` | `512` | Bounded source-state slots; normalized to at most 2× the global connection limit and 65,535 |
 | `GUARD_MAX_QUERIES_PER_CONN` | `1024` | Keep-alive reuse ceiling; the final allowed query is answered, then the connection closes |
 | `GUARD_MAX_RESPONSE_BYTES` | `65535` (code) | Maximum buffered DoH response body |
 | `GUARD_BACKEND_DIAL_TIMEOUT` | `1s` | Loopback backend dial deadline; also used by `/healthz` |
@@ -47,9 +47,9 @@ The public guard deliberately has **no token bucket or request-rate limiter**. A
 | `caching.maxItemsCount` | `8192` | Bounded DNS cache entry count |
 | `caching.prefetching` | `false` | Avoids extra upstream traffic and cache churn |
 
-`GOMEMLIMIT` is a soft Go runtime heap target, not a hard container-memory cap. The combined 352 MiB heap targets leave roughly 160 MiB for stacks, runtime/native memory, buffers, the filesystem, and the container environment.
+`GOMEMLIMIT` is a soft Go runtime heap target, not a hard container-memory cap. The combined 352 MiB heap targets leave roughly 160 MiB for stacks, runtime/native memory, buffers, the filesystem, and the container environment. The supervisor explicitly replaces inherited `GOMEMLIMIT`/`GOMAXPROCS` values for the Blocky child so Blocky receives its intended 288 MiB / 1-CPU profile.
 
-There is deliberately no per-request token bucket. The bounded connection/state tables, request-size limit, small in-flight ceiling, four-connection backend pool, timeouts, and response validation provide resource protection without allocating attacker-growable request-rate state or throttling legitimate bursts from many devices sharing one public IP.
+There is deliberately no second per-request token bucket in the application. On the shared `containers.snapdeploy.app` domain, SnapDeploy itself limits one source IP to 100 requests/minute and blocks higher-volume clients for 10 minutes; the guard therefore focuses on bounded concurrency and memory instead of duplicating that edge rate limiter. The 256-connection ceiling, 512-state table, 16-request aggregate ceiling, 8-request per-source ceiling, and 8-connection backend pool provide room for many source IPs without letting a single slow upstream workload consume the entire container. [SnapDeploy FAQ](https://snapdeploy.dev/docs/faq) and [Scaling](https://snapdeploy.dev/docs/scaling)
 
 Rejected direct-client policy/validation requests are disconnected rather than answered, while a trusted platform proxy receives explicit `400`, `404`, `429`, `502`, or health `503` status codes. A normal client disconnect is not treated as an upstream failure; backend timeouts, invalid DNS responses, oversized responses, and premature backend termination become explicit `502 Bad Gateway` responses.
 
@@ -79,11 +79,15 @@ Behind the SnapDeploy proxy, the TCP peer is expected to be an internal/private 
 
 For HTTP/2/keep-alive traffic, a platform edge connection may carry many real users. Those users share the global socket budget but are separated for request accounting by the forwarded client IP. IPv6 client identities are grouped by `/64`.
 
-The forwarded client address is used only for per-client concurrency accounting and the normalized loopback `X-Forwarded-For` header sent to Blocky.
+The forwarded client address is used only for per-client concurrency accounting and the normalized loopback `X-Forwarded-For` header sent to Blocky. The source-state table uses 16 shards so the 512-entry default does not fragment into tiny four-entry buckets, avoiding avoidable rejection of otherwise admissible source IPs under a many-client workload.
 
 ## Health and failure behavior
 
 The public health endpoint is `GET`/`HEAD /healthz`. It performs only a bounded TCP dial to Blocky's loopback HTTP listener and returns `200` when Blocky's listener is reachable, otherwise `503`. It has no separate rate bucket and still inherits the global accept-time connection ceiling. The container healthcheck separately probes Blocky's loopback DNS listener at `127.0.0.1:5300`.
+
+## SnapDeploy deployment note
+
+SnapDeploy's current Scaling documentation permits automated traffic on the shared domain but prohibits proxies, VPN panels, tunnels, and similar relay services. Because this project exposes a public DNS-over-HTTPS gateway, review the current SnapDeploy Terms/Acceptable Use Policy before deploying or publishing it. [SnapDeploy Scaling](https://snapdeploy.dev/docs/scaling)
 
 The guard buffers successful DoH responses and validates DNS framing before writing `200 OK`. A prematurely terminated or malformed backend response therefore cannot escape as a truncated successful response.
 
