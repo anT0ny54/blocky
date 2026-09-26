@@ -76,29 +76,53 @@ func TestSourceTableIsBounded(t *testing.T) {
 
 func TestDefaultResourceProfile(t *testing.T) {
 	cfg := defaultGuardConfig()
-	if cfg.MaxPerIPConns != 32 {
-		t.Fatalf("per-IP connections = %d, want 32", cfg.MaxPerIPConns)
+	if cfg.MaxGlobalConns != 128 {
+		t.Fatalf("global connections = %d, want 128", cfg.MaxGlobalConns)
 	}
-	if cfg.MaxConcurrentReqs != 32 || cfg.MaxConcurrentReqsPerIP != 8 {
-		t.Fatalf("request concurrency = %d/%d, want 32/8", cfg.MaxConcurrentReqs, cfg.MaxConcurrentReqsPerIP)
+	if cfg.MaxPerIPConns != 64 {
+		t.Fatalf("per-IP connections = %d, want 64", cfg.MaxPerIPConns)
 	}
-	if cfg.BackendTimeout != 6*time.Second {
-		t.Fatalf("server timeout = %s, want 6s", cfg.BackendTimeout)
+	if cfg.MaxDNSMessage != 4096 {
+		t.Fatalf("DoH body size = %d, want 4096", cfg.MaxDNSMessage)
+	}
+	if cfg.MaxUpstreamConns != 4 {
+		t.Fatalf("upstream connections = %d, want 4", cfg.MaxUpstreamConns)
+	}
+	if cfg.MaxConcurrentReqs != 8 || cfg.MaxConcurrentReqsPerIP != 4 {
+		t.Fatalf("request concurrency = %d/%d, want 8/4", cfg.MaxConcurrentReqs, cfg.MaxConcurrentReqsPerIP)
+	}
+	if cfg.MaxSourceStates != 256 {
+		t.Fatalf("source states = %d, want 256", cfg.MaxSourceStates)
+	}
+	if cfg.BackendTimeout != 8*time.Second {
+		t.Fatalf("guard response timeout = %s, want 8s", cfg.BackendTimeout)
 	}
 }
 
 func TestResourceEnvironmentOverrides(t *testing.T) {
-	t.Setenv("IP_CONN_LIMIT", "33")
-	t.Setenv("GUARD_MAX_CONCURRENT_REQS", "40")
+	t.Setenv("GLOBAL_CONN_LIMIT", "33")
+	t.Setenv("IP_CONN_LIMIT", "34")
+	t.Setenv("DOH_MAX_BODY_BYTES", "2048")
+	t.Setenv("UPSTREAM_MAX_CONNS", "5")
+	t.Setenv("GUARD_MAX_CONCURRENT_REQS", "10")
 	t.Setenv("GUARD_MAX_CONCURRENT_REQS_PER_IP", "9")
-	t.Setenv("SERVER_TIMEOUT", "7")
+	t.Setenv("GUARD_RESPONSE_TIMEOUT", "7")
 
 	cfg := loadGuardConfig()
-	if cfg.MaxPerIPConns != 33 || cfg.MaxConcurrentReqs != 40 || cfg.MaxConcurrentReqsPerIP != 9 {
-		t.Fatalf("resource env override mismatch: ip=%d global=%d per-ip=%d", cfg.MaxPerIPConns, cfg.MaxConcurrentReqs, cfg.MaxConcurrentReqsPerIP)
+	if cfg.MaxGlobalConns != 33 || cfg.MaxPerIPConns != 34 || cfg.MaxDNSMessage != 2048 || cfg.MaxUpstreamConns != 5 || cfg.MaxConcurrentReqs != 10 || cfg.MaxConcurrentReqsPerIP != 9 {
+		t.Fatalf("resource env override mismatch: global=%d ip=%d body=%d upstream=%d global-req=%d per-ip-req=%d", cfg.MaxGlobalConns, cfg.MaxPerIPConns, cfg.MaxDNSMessage, cfg.MaxUpstreamConns, cfg.MaxConcurrentReqs, cfg.MaxConcurrentReqsPerIP)
 	}
 	if cfg.BackendTimeout != 7*time.Second {
-		t.Fatalf("server timeout = %s, want 7s", cfg.BackendTimeout)
+		t.Fatalf("response timeout = %s, want 7s", cfg.BackendTimeout)
+	}
+}
+
+func TestLegacyGuardEnvironmentNamesStillWork(t *testing.T) {
+	t.Setenv("GUARD_MAX_GLOBAL_CONNS", "44")
+	t.Setenv("GUARD_MAX_DNS_MESSAGE", "3072")
+	cfg := loadGuardConfig()
+	if cfg.MaxGlobalConns != 44 || cfg.MaxDNSMessage != 3072 {
+		t.Fatalf("legacy env aliases failed: global=%d body=%d", cfg.MaxGlobalConns, cfg.MaxDNSMessage)
 	}
 }
 
@@ -249,6 +273,56 @@ func TestGlobalRequestConcurrencyIsBounded(t *testing.T) {
 	g.releaseGlobalRequest()
 }
 
+func TestTrustedProxyRejectsMissingOrInvalidClientIdentity(t *testing.T) {
+	g := NewGuard(defaultGuardConfig())
+	state := &trackedConn{source: "10.0.0.2", trusted: true, guard: g}
+
+	for _, header := range []string{"", "not-an-ip", "198.51.100.8, 10.0.0.2"} {
+		req, err := http.NewRequest(http.MethodGet, "http://guard/dns-query?dns=AAE", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if header != "" {
+			req.Header.Set("X-Forwarded-For", header)
+		}
+		req = req.WithContext(context.WithValue(req.Context(), connStateKey{}, state))
+		w := httptest.NewRecorder()
+		g.Handler().ServeHTTP(w, req)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("header %q produced status %d, want 400", header, w.Code)
+		}
+	}
+}
+
+func TestNormalizeSourceStateCapFollowsGlobalConnections(t *testing.T) {
+	cfg := defaultGuardConfig()
+	cfg.MaxGlobalConns = 100
+	cfg.MaxSourceStates = 1000
+	cfg.normalize()
+	if cfg.MaxSourceStates != 200 {
+		t.Fatalf("source state cap = %d, want 200", cfg.MaxSourceStates)
+	}
+
+	cfg.MaxGlobalConns = 40000
+	cfg.MaxSourceStates = 65535
+	cfg.normalize()
+	if cfg.MaxSourceStates != 65535 {
+		t.Fatalf("hard source state cap = %d, want 65535", cfg.MaxSourceStates)
+	}
+}
+
+func TestBackendPoolUsesConfiguredConnectionCeiling(t *testing.T) {
+	cfg := defaultGuardConfig()
+	g := NewGuard(cfg)
+	tr, ok := g.backend.Transport.(*http.Transport)
+	if !ok {
+		t.Fatal("backend transport is not *http.Transport")
+	}
+	if tr.MaxConnsPerHost != 4 || tr.MaxIdleConns != 4 || tr.MaxIdleConnsPerHost != 4 {
+		t.Fatalf("backend pool = max=%d idle=%d idle-host=%d, want 4/4/4", tr.MaxConnsPerHost, tr.MaxIdleConns, tr.MaxIdleConnsPerHost)
+	}
+}
+
 func TestNormalizeCapsRequestConcurrencyToPlatformInt(t *testing.T) {
 	maxPlatformInt := int64(^uint(0) >> 1)
 	if maxPlatformInt < int64(^uint32(0)) {
@@ -276,9 +350,58 @@ func TestGlobalConnectionAdmissionIsNonBlockingAtLimit(t *testing.T) {
 	}
 }
 
+func TestHealthEndpointChecksBackendTCP(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	backendAddr := strings.TrimPrefix(backend.URL, "http://")
+	backend.Close()
+
+	listener, err := net.Listen("tcp", backendAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	cfg := defaultGuardConfig()
+	cfg.BackendHTTP = backendAddr
+	g := NewGuard(cfg)
+	source := "192.0.2.76"
+	if !g.states.admitConn(source, cfg.MaxPerIPConns, time.Now()) || !g.admitGlobal() {
+		t.Fatal("request admission failed")
+	}
+	defer func() {
+		g.states.releaseConn(source)
+		g.releaseGlobal()
+	}()
+
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		req, err := http.NewRequest(method, "http://guard/healthz", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req = req.WithContext(context.WithValue(req.Context(), connStateKey{}, &trackedConn{source: source, guard: g}))
+		w := httptest.NewRecorder()
+		g.Handler().ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s health status = %d, want 200", method, w.Code)
+		}
+	}
+
+	listener.Close()
+	req, err := http.NewRequest(http.MethodGet, "http://guard/healthz", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req = req.WithContext(context.WithValue(req.Context(), connStateKey{}, &trackedConn{source: source, guard: g}))
+	w := httptest.NewRecorder()
+	g.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("unhealthy status = %d, want 503", w.Code)
+	}
+}
+
 func TestDoHProxySanitizesForwardedClientIP(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if got := r.Header.Get("X-Forwarded-For"); got != "192.0.2.77" {
+		if got := r.Header.Get("X-Forwarded-For"); got != "203.0.113.200" {
 			t.Fatalf("backend saw spoofable client IP header %q", got)
 		}
 		w.Header().Set("Content-Type", "application/dns-message")
@@ -289,7 +412,7 @@ func TestDoHProxySanitizesForwardedClientIP(t *testing.T) {
 	cfg := defaultGuardConfig()
 	cfg.BackendHTTP = strings.TrimPrefix(backend.URL, "http://")
 	g := NewGuard(cfg)
-	ok := g.states.admitConn("192.0.2.77", cfg.MaxPerIPConns, time.Now())
+	ok := g.states.admitConn("10.0.0.2", cfg.MaxPerIPConns, time.Now())
 	if !ok {
 		t.Fatal("client state admission failed")
 	}
@@ -297,7 +420,7 @@ func TestDoHProxySanitizesForwardedClientIP(t *testing.T) {
 		t.Fatal("global connection admission failed")
 	}
 	defer func() {
-		g.states.releaseConn("192.0.2.77")
+		g.states.releaseConn("10.0.0.2")
 		g.releaseGlobal()
 	}()
 
@@ -306,7 +429,7 @@ func TestDoHProxySanitizesForwardedClientIP(t *testing.T) {
 		t.Fatal(err)
 	}
 	req.Header.Set("X-Forwarded-For", "203.0.113.200")
-	req = req.WithContext(context.WithValue(req.Context(), connStateKey{}, &trackedConn{source: "192.0.2.77", guard: g}))
+	req = req.WithContext(context.WithValue(req.Context(), connStateKey{}, &trackedConn{source: "10.0.0.2", trusted: true, guard: g}))
 	w := httptest.NewRecorder()
 	g.Handler().ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
@@ -323,6 +446,7 @@ func TestNormalizeClampsUnsafeValues(t *testing.T) {
 		MaxQueriesPerConn:      0,
 		MaxConcurrentReqs:      0,
 		MaxConcurrentReqsPerIP: 0,
+		MaxUpstreamConns:       0,
 		MaxHeaderBytes:         1,
 		MaxResponseBytes:       1,
 	}
@@ -336,6 +460,7 @@ func TestNormalizeClampsUnsafeValues(t *testing.T) {
 		"queries":         {int64(cfg.MaxQueriesPerConn), int64(defaults.MaxQueriesPerConn)},
 		"requests":        {cfg.MaxConcurrentReqs, defaults.MaxConcurrentReqs},
 		"requests-per-ip": {int64(cfg.MaxConcurrentReqsPerIP), int64(defaults.MaxConcurrentReqsPerIP)},
+		"upstream-conns":  {int64(cfg.MaxUpstreamConns), int64(defaults.MaxUpstreamConns)},
 	} {
 		if values[0] != values[1] {
 			t.Fatalf("%s: got %d, want %d", name, values[0], values[1])
@@ -784,10 +909,15 @@ func TestIsInternalIP(t *testing.T) {
 
 func TestClientIPFromHeaderIgnoresClientInjectedValues(t *testing.T) {
 	h := make(http.Header)
-	h.Set("X-Forwarded-For", "198.51.100.99, 203.0.113.5, 10.0.0.2")
+	h.Set("X-Forwarded-For", "198.51.100.99, 203.0.113.5")
 	ip, ok := clientIPFromHeader(h, "X-Forwarded-For")
 	if !ok || ip.String() != "203.0.113.5" {
-		t.Fatalf("got %v %v, want the right-most public hop 203.0.113.5", ip, ok)
+		t.Fatalf("got %v %v, want final public value 203.0.113.5", ip, ok)
+	}
+
+	h.Set("X-Forwarded-For", "198.51.100.99, 203.0.113.5, 10.0.0.2")
+	if _, ok := clientIPFromHeader(h, "X-Forwarded-For"); ok {
+		t.Fatal("internal final forwarding value should be rejected")
 	}
 
 	h.Set("X-Forwarded-For", "203.0.113.5, not-an-ip")

@@ -27,10 +27,11 @@ const (
 	defaultListenAddr       = ":4001"
 	defaultBackendHTTP      = "127.0.0.1:4002"
 	defaultDohPath          = "/dns-query"
-	defaultGlobalConns      = 512
-	defaultPerIPConns       = 32 // IP_CONN_LIMIT: per-source concurrent connections
-	defaultMaxSourceStates  = 16384
-	defaultMaxDNSMessage    = 4096
+	defaultHealthPath       = "/healthz"
+	defaultGlobalConns      = 128  // GLOBAL_CONN_LIMIT
+	defaultPerIPConns       = 64   // IP_CONN_LIMIT
+	defaultMaxSourceStates  = 256  // up to 2x the default global connection ceiling
+	defaultMaxDNSMessage    = 4096 // DOH_MAX_BODY_BYTES
 	defaultMaxQueriesConn   = 1024
 	defaultMaxHeaderBytes   = 16 << 10
 	defaultResponseMaxBytes = 65535
@@ -39,10 +40,12 @@ const (
 	defaultReadTimeout      = 10 * time.Second
 	defaultWriteTimeout     = 10 * time.Second
 	defaultIdleTimeout      = 60 * time.Second
-	defaultBackendTimeout   = 6 * time.Second // SERVER_TIMEOUT: backend query deadline
-	defaultMaxRequests      = 32
-	defaultMaxRequestsPerIP = 8
-	defaultBlockyMemLimit   = "320MiB"
+	defaultBackendTimeout   = 8 * time.Second // public guard response wait
+	defaultBackendDial      = 1 * time.Second
+	defaultMaxUpstreamConns = 4 // UPSTREAM_MAX_CONNS: guard -> Blocky loopback pool
+	defaultMaxRequests      = 8 // bounded in-flight work above the 4-connection backend pool
+	defaultMaxRequestsPerIP = 4
+	defaultBlockyMemLimit   = "288MiB"
 
 	stateShards = 64
 
@@ -58,6 +61,7 @@ type GuardConfig struct {
 	ListenAddr             string
 	BackendHTTP            string
 	DOHPath                string
+	HealthPath             string
 	ClientIPHeader         string
 	MaxGlobalConns         int64
 	MaxPerIPConns          int32
@@ -66,6 +70,8 @@ type GuardConfig struct {
 	MaxQueriesPerConn      uint32
 	MaxConcurrentReqs      int64
 	MaxConcurrentReqsPerIP int32
+	MaxUpstreamConns       int
+	BackendDialTimeout     time.Duration
 	StateIdle              time.Duration
 	ReadHeaderTimeout      time.Duration
 	ReadTimeout            time.Duration
@@ -81,6 +87,8 @@ func defaultGuardConfig() GuardConfig {
 		ListenAddr:             defaultListenAddr,
 		BackendHTTP:            defaultBackendHTTP,
 		DOHPath:                defaultDohPath,
+		HealthPath:             defaultHealthPath,
+		ClientIPHeader:         http.CanonicalHeaderKey("X-Forwarded-For"),
 		MaxGlobalConns:         defaultGlobalConns,
 		MaxPerIPConns:          defaultPerIPConns,
 		MaxSourceStates:        defaultMaxSourceStates,
@@ -88,6 +96,8 @@ func defaultGuardConfig() GuardConfig {
 		MaxQueriesPerConn:      defaultMaxQueriesConn,
 		MaxConcurrentReqs:      defaultMaxRequests,
 		MaxConcurrentReqsPerIP: defaultMaxRequestsPerIP,
+		MaxUpstreamConns:       defaultMaxUpstreamConns,
+		BackendDialTimeout:     defaultBackendDial,
 		StateIdle:              defaultStateIdle,
 		ReadHeaderTimeout:      defaultReadHeader,
 		ReadTimeout:            defaultReadTimeout,
@@ -104,20 +114,23 @@ func loadGuardConfig() GuardConfig {
 	c.ListenAddr = envString("GUARD_LISTEN", c.ListenAddr)
 	c.BackendHTTP = envString("GUARD_BACKEND", c.BackendHTTP)
 	c.DOHPath = envString("GUARD_DOH_PATH", c.DOHPath)
+	c.HealthPath = envString("GUARD_HEALTH_PATH", c.HealthPath)
 	c.ClientIPHeader = envHeader("GUARD_CLIENT_IP_HEADER", c.ClientIPHeader)
-	c.MaxGlobalConns = envInt64("GUARD_MAX_GLOBAL_CONNS", c.MaxGlobalConns)
+	c.MaxGlobalConns = envInt64("GLOBAL_CONN_LIMIT", envInt64("GUARD_MAX_GLOBAL_CONNS", c.MaxGlobalConns))
 	c.MaxPerIPConns = envInt32("IP_CONN_LIMIT", c.MaxPerIPConns)
 	c.MaxSourceStates = envInt("GUARD_MAX_IP_STATES", c.MaxSourceStates)
-	c.MaxDNSMessage = envInt("GUARD_MAX_DNS_MESSAGE", c.MaxDNSMessage)
+	c.MaxDNSMessage = envInt("DOH_MAX_BODY_BYTES", envInt("GUARD_MAX_DNS_MESSAGE", c.MaxDNSMessage))
 	c.MaxQueriesPerConn = envUint32("GUARD_MAX_QUERIES_PER_CONN", c.MaxQueriesPerConn)
 	c.MaxConcurrentReqs = envInt64("GUARD_MAX_CONCURRENT_REQS", c.MaxConcurrentReqs)
 	c.MaxConcurrentReqsPerIP = envInt32("GUARD_MAX_CONCURRENT_REQS_PER_IP", c.MaxConcurrentReqsPerIP)
+	c.MaxUpstreamConns = envInt("UPSTREAM_MAX_CONNS", c.MaxUpstreamConns)
+	c.BackendDialTimeout = envDuration("GUARD_BACKEND_DIAL_TIMEOUT", c.BackendDialTimeout)
 	c.StateIdle = envDuration("GUARD_STATE_IDLE", c.StateIdle)
 	c.ReadHeaderTimeout = envDuration("GUARD_READ_HEADER_TIMEOUT", c.ReadHeaderTimeout)
 	c.ReadTimeout = envDuration("GUARD_READ_TIMEOUT", c.ReadTimeout)
 	c.WriteTimeout = envDuration("GUARD_WRITE_TIMEOUT", c.WriteTimeout)
 	c.IdleTimeout = envDuration("GUARD_IDLE_TIMEOUT", c.IdleTimeout)
-	c.BackendTimeout = envSecondsOrDuration("SERVER_TIMEOUT", c.BackendTimeout)
+	c.BackendTimeout = envSecondsOrDuration("GUARD_RESPONSE_TIMEOUT", c.BackendTimeout)
 	c.MaxHeaderBytes = envInt("GUARD_MAX_HEADER_BYTES", c.MaxHeaderBytes)
 	c.MaxResponseBytes = envInt64("GUARD_MAX_RESPONSE_BYTES", c.MaxResponseBytes)
 	c.normalize()
@@ -134,6 +147,9 @@ func (c *GuardConfig) normalize() {
 	if c.DOHPath == "" || c.DOHPath[0] != '/' {
 		c.DOHPath = defaultDohPath
 	}
+	if c.HealthPath == "" || c.HealthPath[0] != '/' || c.HealthPath == c.DOHPath {
+		c.HealthPath = defaultHealthPath
+	}
 	if c.MaxGlobalConns < 1 {
 		c.MaxGlobalConns = defaultGlobalConns
 	}
@@ -142,6 +158,16 @@ func (c *GuardConfig) normalize() {
 	}
 	if c.MaxSourceStates < 1 {
 		c.MaxSourceStates = defaultMaxSourceStates
+	}
+	stateCap := c.MaxGlobalConns * 2
+	if stateCap < 1 {
+		stateCap = 2
+	}
+	if stateCap > 65535 {
+		stateCap = 65535
+	}
+	if int64(c.MaxSourceStates) > stateCap {
+		c.MaxSourceStates = int(stateCap)
 	}
 	if c.MaxDNSMessage < 64 || c.MaxDNSMessage > 65535 {
 		c.MaxDNSMessage = defaultMaxDNSMessage
@@ -155,6 +181,12 @@ func (c *GuardConfig) normalize() {
 	}
 	if c.MaxConcurrentReqsPerIP < 1 {
 		c.MaxConcurrentReqsPerIP = defaultMaxRequestsPerIP
+	}
+	if c.MaxUpstreamConns < 1 {
+		c.MaxUpstreamConns = defaultMaxUpstreamConns
+	}
+	if c.MaxUpstreamConns > 65535 {
+		c.MaxUpstreamConns = 65535
 	}
 	if int64(c.MaxConcurrentReqsPerIP) > c.MaxConcurrentReqs {
 		c.MaxConcurrentReqsPerIP = int32(c.MaxConcurrentReqs)
@@ -173,6 +205,9 @@ func (c *GuardConfig) normalize() {
 	}
 	if c.IdleTimeout <= 0 {
 		c.IdleTimeout = defaultIdleTimeout
+	}
+	if c.BackendDialTimeout <= 0 {
+		c.BackendDialTimeout = defaultBackendDial
 	}
 	if c.BackendTimeout <= 0 {
 		c.BackendTimeout = defaultBackendTimeout
@@ -437,11 +472,11 @@ func NewGuard(cfg GuardConfig) *Guard {
 	tr := &http.Transport{
 		Proxy: nil,
 		DialContext: (&net.Dialer{
-			Timeout: 2 * time.Second,
+			Timeout: cfg.BackendDialTimeout,
 		}).DialContext,
-		MaxConnsPerHost:        int(cfg.MaxConcurrentReqs),
-		MaxIdleConns:           16,
-		MaxIdleConnsPerHost:    16,
+		MaxConnsPerHost:        cfg.MaxUpstreamConns,
+		MaxIdleConns:           cfg.MaxUpstreamConns,
+		MaxIdleConnsPerHost:    cfg.MaxUpstreamConns,
 		IdleConnTimeout:        20 * time.Second,
 		ResponseHeaderTimeout:  cfg.BackendTimeout,
 		MaxResponseHeaderBytes: int64(cfg.MaxHeaderBytes),
@@ -542,33 +577,33 @@ func parseHeaderIP(token string) net.IP {
 	return nil
 }
 
-// clientIPFromHeader extracts the real client from a forwarding header set by
-// the platform proxy. It walks the list from the right (the entries appended by
-// our own trusted hops) and returns the first non-internal address, so values
-// injected by the client on the left can never be selected. Malformed input is
-// rejected so the caller falls back to the connection peer.
+// clientIPFromHeader extracts the final trusted client identity from the
+// forwarding header. For this deployment the final value is the only value
+// accepted as certifiable; an internal, malformed, or missing final value is
+// rejected instead of falling back to a shared proxy bucket.
 func clientIPFromHeader(h http.Header, name string) (net.IP, bool) {
 	values := h.Values(name)
-	for i := len(values) - 1; i >= 0; i-- {
-		tokens := strings.Split(values[i], ",")
-		for j := len(tokens) - 1; j >= 0; j-- {
-			ip := parseHeaderIP(tokens[j])
-			if ip == nil {
-				return nil, false
-			}
-			if !isInternalIP(ip) {
-				return ip, true
-			}
-		}
+	if len(values) == 0 {
+		return nil, false
 	}
-	return nil, false
+	last := strings.TrimSpace(values[len(values)-1])
+	parts := strings.Split(last, ",")
+	if len(parts) == 0 {
+		return nil, false
+	}
+	token := strings.TrimSpace(parts[len(parts)-1])
+	ip := parseHeaderIP(token)
+	if ip == nil || isInternalIP(ip) {
+		return nil, false
+	}
+	return ip, true
 }
 
 type trackedConn struct {
 	net.Conn
 	guard    *Guard
 	source   string
-	trusted  bool // peer is a platform-internal proxy whose forwarding header is honoured
+	trusted  bool // peer is a platform-internal proxy whose final forwarding value is required
 	released sync.Once
 	queries  atomic.Uint32
 }
@@ -644,6 +679,15 @@ func (l *guardedListener) Close() error {
 
 func (l *guardedListener) Addr() net.Addr { return l.inner.Addr() }
 
+func (g *Guard) backendHealthy() bool {
+	conn, err := net.DialTimeout("tcp", g.cfg.BackendHTTP, g.cfg.BackendDialTimeout)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
+}
+
 func (g *Guard) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		state, ok := r.Context().Value(connStateKey{}).(*trackedConn)
@@ -661,10 +705,22 @@ func (g *Guard) Handler() http.Handler {
 		// real client is taken from the forwarding header (see clientIPFromHeader).
 		client := state.source
 		if state.trusted {
-			if ip, ok := clientIPFromHeader(r.Header, g.cfg.ClientIPHeader); ok {
-				client = canonicalIPKey(ip)
+			ip, ok := clientIPFromHeader(r.Header, g.cfg.ClientIPHeader)
+			if !ok {
+				g.reject(w, state, http.StatusBadRequest)
+				return
 			}
+			client = canonicalIPKey(ip)
 		}
+		if r.URL.Path == g.cfg.HealthPath && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+			if g.backendHealthy() {
+				w.WriteHeader(http.StatusOK)
+			} else {
+				w.WriteHeader(http.StatusServiceUnavailable)
+			}
+			return
+		}
+
 		now := time.Now()
 		if !g.acquireRequest() {
 			g.reject(w, state, http.StatusTooManyRequests)
@@ -678,10 +734,8 @@ func (g *Guard) Handler() http.Handler {
 		defer g.releaseRequest(client)
 
 		if r.URL.Path != g.cfg.DOHPath || (r.Method != http.MethodGet && r.Method != http.MethodPost) {
-			// Answer platform health/readiness probes (e.g. SnapDeploy's wake
-			// check hitting "/") instead of silently hijacking and closing the
-			// connection. Only a cheap, static 200 on GET "/" with no body is
-			// exempted; everything else still gets dropped.
+			// Keep GET / as a cheap platform wake/readiness compatibility response.
+			// Real backend health is exposed separately at /healthz (GET/HEAD).
 			if r.URL.Path == "/" && r.Method == http.MethodGet {
 				w.WriteHeader(http.StatusOK)
 				return
@@ -987,12 +1041,12 @@ func (g *Guard) Run(ctx context.Context) error {
 }
 
 func runHealthcheck() error {
-	conn, err := net.DialTimeout("udp", "127.0.0.1:5300", 2*time.Second)
+	conn, err := net.DialTimeout("udp", "127.0.0.1:5300", defaultBackendDial)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	_ = conn.SetDeadline(time.Now().Add(defaultBackendDial))
 	query := []byte{
 		0x12, 0x34, 0x01, 0x00,
 		0x00, 0x01, 0x00, 0x00,
